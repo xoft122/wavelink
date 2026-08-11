@@ -39,7 +39,7 @@ To connect your account, WaveLink uses a matching **SoundCloud OAuth access toke
 | History | A persistent local WaveLink history with expandable lists and per-track deletion |
 
 <p align="center">
-  <img src="preview.png" alt="WaveLink interface" width="100%">
+  <img src="screen.png" alt="WaveLink interface" width="100%">
 </p>
 
 WaveLink also restores the Spotify interface when handing playback back to Spotify, keeps queue context beyond the visible rows, remembers the current WaveLink page for the lifetime of the Spotify session, and restores an active SoundCloud track, queue, context, and position after Spotify restarts.
