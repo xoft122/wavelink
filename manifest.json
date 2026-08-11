@@ -1,0 +1,8 @@
+{
+  "icon": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 48 48\">\n  <defs>\n    <linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\">\n      <stop stop-color=\"#ff7a18\"/>\n      <stop offset=\"1\" stop-color=\"#ff3d81\"/>\n    </linearGradient>\n  </defs>\n  <rect width=\"48\" height=\"48\" rx=\"14\" fill=\"url(#g)\"/>\n  <path d=\"M8 27c4.4 0 4.4-10 8.8-10s4.4 14 8.8 14 4.4-10 8.8-10S38.8 27 40 27\" fill=\"none\" stroke=\"#fff\" stroke-width=\"4\" stroke-linecap=\"round\"/>\n</svg>\n",
+  "active-icon": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 48 48\">\n  <defs>\n    <linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\">\n      <stop stop-color=\"#ff7a18\"/>\n      <stop offset=\"1\" stop-color=\"#ff3d81\"/>\n    </linearGradient>\n  </defs>\n  <rect width=\"48\" height=\"48\" rx=\"14\" fill=\"url(#g)\"/>\n  <path d=\"M8 27c4.4 0 4.4-10 8.8-10s4.4 14 8.8 14 4.4-10 8.8-10S38.8 27 40 27\" fill=\"none\" stroke=\"#fff\" stroke-width=\"4\" stroke-linecap=\"round\"/>\n</svg>\n",
+  "subfiles": [],
+  "subfiles_extension": [
+    "extension.js"
+  ]
+}
