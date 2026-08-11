@@ -1,0 +1,20 @@
+{
+  "name": "WaveLink",
+  "description": "Bring SoundCloud into Spotify with browsing, search, library, playlists, profiles, and integrated playback.",
+  "preview": "preview.png",
+  "readme": "README.md",
+  "authors": [
+    {
+      "name": "xoft122",
+      "url": "https://github.com/xoft122"
+    }
+  ],
+  "tags": [
+    "soundcloud",
+    "player",
+    "search",
+    "music",
+    "streaming",
+    "integration"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "nameId": "wavelink",
+  "name": "WaveLink",
+  "icon": "icon.svg",
+  "active-icon": "active-icon.svg",
+  "subfiles": [],
+  "subfiles_extension": ["extensions/extension"]
+}

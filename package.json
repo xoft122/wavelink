@@ -1,0 +1,30 @@
+{
+  "name": "wavelink-spicetify",
+  "version": "3.0.71",
+  "private": true,
+  "description": "A no-local-bridge SoundCloud experience for Spicetify with OAuth, library features and Spotify-bar playback.",
+  "type": "commonjs",
+  "scripts": {
+    "build": "spicetify-creator --out dist",
+    "build:install": "spicetify-creator",
+    "watch": "spicetify-creator --watch --out dist",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
+    "test:sandbox": "node --test --test-isolation=none --test-concurrency=1 tests/*.test.mjs",
+    "verify": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "hls.js": "1.6.16"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.15",
+    "@types/react": "18.3.23",
+    "@types/react-dom": "18.3.7",
+    "spicetify-creator": "1.0.17",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=20.17"
+  },
+  "license": "MIT"
+}
