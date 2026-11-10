@@ -2,6 +2,7 @@ import {
   SCCollection,
   SCLikedTrack,
   SCMediaSource,
+  SCAacRendition,
   SCPlaylist,
   SCStreamItem,
   SCTrack,
@@ -1055,8 +1056,10 @@ export interface DirectTrackStreams {
 export interface DirectMediaResolveOptions
   extends Omit<DirectRequestOptions, "method" | "query" | "body"> {
   consumerProductAvailable?: boolean;
-  /** Retry a decoder-incompatible AAC 160 stream using the alternate rendition. */
-  excludeHighQualityAac?: boolean;
+  /** Pick the more compatible rendition before starting the software decoder. */
+  preferStandardAac?: boolean;
+  /** Do not retry the same rendition after a decoder failure. */
+  excludeAacRendition?: SCAacRendition;
 }
 
 function isHighQualityAac(value: RawTranscoding): boolean {
@@ -1088,13 +1091,13 @@ function isHighQualityAac(value: RawTranscoding): boolean {
   );
 }
 
-function transcodingRank(value: RawTranscoding): number {
+function transcodingRank(value: RawTranscoding, preferStandardAac: boolean): number {
   const format = isRecord(value.format) ? value.format : {};
   const protocol = String(format.protocol ?? "").toLowerCase();
   const isHls = protocol === "hls" || protocol === "hls-aes";
   const codec = transcodingCodec(value);
   if (protocol === "progressive" && codec === "mp3") return 600;
-  if (isHls && codec === "aac") return isHighQualityAac(value) ? 520 : 500;
+  if (isHls && codec === "aac") return isHighQualityAac(value) !== preferStandardAac ? 520 : 500;
   if (isHls && codec === "mp3") return 400;
   return -1;
 }
@@ -1252,7 +1255,8 @@ async function resolveStreamsFromTrack(
   expectedTrackId: string,
   options: Omit<DirectRequestOptions, "method" | "query" | "body">,
   consumerProductAvailable?: boolean,
-  excludeHighQualityAac = false,
+  preferStandardAac = false,
+  excludeAacRendition?: SCAacRendition,
 ): Promise<DirectTrackStreams> {
   const policy =
     typeof rawTrack.policy === "string"
@@ -1319,7 +1323,7 @@ async function resolveStreamsFromTrack(
   const candidates = transcodings
     .map((transcoding) => ({
       transcoding,
-      rank: transcodingRank(transcoding),
+      rank: transcodingRank(transcoding, preferStandardAac),
       field: streamField(transcoding),
       fullness:
         transcoding.snipped === false
@@ -1335,7 +1339,8 @@ async function resolveStreamsFromTrack(
         field: keyof DirectTrackStreams;
         fullness: number;
       } => candidate.rank >= 0 && candidate.field !== null &&
-        !(excludeHighQualityAac && candidate.field === "hls_aac_160_url"),
+        !(excludeAacRendition === 160 && candidate.field === "hls_aac_160_url") &&
+        !(excludeAacRendition === 96 && candidate.field === "hls_aac_96_url"),
     )
     .sort(
       (left, right) =>
@@ -1397,7 +1402,8 @@ export async function resolveDirectTrackStreams(
 ): Promise<{ track: unknown; streams: DirectTrackStreams }> {
   const {
     consumerProductAvailable,
-    excludeHighQualityAac,
+    preferStandardAac,
+    excludeAacRendition,
     ...requestOptions
   } = options;
   const trackId = soundCloudNumericId(urn, "track");
@@ -1417,7 +1423,8 @@ export async function resolveDirectTrackStreams(
     trackId,
     requestOptions,
     consumerProductAvailable,
-    excludeHighQualityAac,
+    preferStandardAac,
+    excludeAacRendition,
   );
   return { track, streams };
 }
@@ -1547,18 +1554,17 @@ export async function resolveDirectMediaSource(
       "expired_media_url",
     );
   }
-  return {
-    kind: progressive ? "progressive" : "hls",
-    codec: progressive
-      ? "mp3"
-      : streams.hls_aac_160_url === selected ||
-          streams.hls_aac_96_url === selected
-        ? "aac"
-        : "mp3",
-    url: mediaUrl.toString(),
-    expiresAt,
-    access,
-  };
+  const media = { url: mediaUrl.toString(), expiresAt, access };
+  if (progressive) return { ...media, kind: "progressive", codec: "mp3" };
+  if (streams.hls_aac_160_url || streams.hls_aac_96_url) {
+    return {
+      ...media,
+      kind: "hls",
+      codec: "aac",
+      aacRendition: streams.hls_aac_160_url ? 160 : 96,
+    };
+  }
+  return { ...media, kind: "hls", codec: "mp3" };
 }
 
 export const createDirectMediaSource = resolveDirectMediaSource;

@@ -1,6 +1,6 @@
 // player.ts
 import Hls from "hls.js";
-import { SCTrack, SCUser, SoundCloudUrn } from "../types/soundcloud";
+import { type SCAacRendition, SCTrack, SCUser, SoundCloudUrn } from "../types/soundcloud";
 import {
   createMediaSession,
   getLikedTrackIds,
@@ -624,7 +624,8 @@ class SoundCloudPlayer {
   private linuxMediaSession: LinuxMediaSessionBridge;
   private hls: Hls | null = null;
   private softwareAac: SoftwareAacPlayback | null = null;
-  private readonly _softwareAacFallbackTracks = new Set<string>();
+  private readonly _softwareAacFallbackTracks = new Map<string, SCAacRendition>();
+  private _softwareAacRecoveryLoadId: number | null = null;
   private softwareAacContext: AudioContext | null = null;
   private _track: SCTrack | null = null;
   private _isLoading = false;
@@ -674,6 +675,7 @@ class SoundCloudPlayer {
     trackKey: string;
     loadId: number;
     positionMs: number;
+    streamRecovery?: true;
   } | null = null;
   private _resumeLastSavedAt = 0;
   private _resumeLastSavedTrackKey = "";
@@ -8569,12 +8571,74 @@ class SoundCloudPlayer {
     this.emit();
   }
 
+  private async handleSoftwareAacFailure(
+    track: SCTrack,
+    loadId: number,
+    playback: SoftwareAacPlayback,
+    cause: Error,
+    requestPlay = false,
+  ): Promise<void> {
+    if (loadId !== this._loadId || this.softwareAac !== playback) return;
+    const key = trackKey(track);
+    if (!(cause instanceof SoftwareAacDecodeError) || this._softwareAacFallbackTracks.has(key)) {
+      this._resumePendingSeek = null;
+      this._playRequestedWhileLoading = false;
+      this.failPlayback(`AAC decoder: ${cause.message}`);
+      return;
+    }
+
+    // Replace only the media source, not the queue entry or its history load
+    // ID. The normal readiness handlers seek before playing the new rendition.
+    this._resumePendingSeek = {
+      loadId,
+      trackKey: key,
+      positionMs: this.playbackResumePositionMs(),
+      streamRecovery: true,
+    };
+    this._playRequestedWhileLoading = requestPlay || this._playRequestedWhileLoading || !playback.paused;
+    this._softwareAacFallbackTracks.set(key, playback.rendition);
+    this._softwareAacRecoveryLoadId = loadId;
+    this._isLoading = true;
+    warn("player", "Switching '%s' to alternate AAC after a decoder failure", track.title);
+
+    try {
+      // Immediately stop the broken rendition and invalidate its callbacks.
+      this.resetMediaSource();
+      if (loadId !== this._loadId) return;
+      this.emit();
+      if (loadId !== this._loadId) return;
+      if (!await this.attachMedia(track, loadId, playback.rendition) || loadId !== this._loadId) return;
+      this.applyPendingPlaybackResumeSeek();
+    } catch (error) {
+      if (loadId !== this._loadId) return;
+      this._resumePendingSeek = null;
+      this._playRequestedWhileLoading = false;
+      const detail = error instanceof Error ? error.message : cause.message;
+      this.failPlayback(`AAC decoder: ${detail}`);
+    } finally {
+      if (this._softwareAacRecoveryLoadId === loadId) {
+        this._softwareAacRecoveryLoadId = null;
+      }
+      if (loadId === this._loadId) {
+        this._isLoading = false;
+        this.emit();
+      }
+    }
+  }
+
   private async attachMedia(
     track: SCTrack,
     loadId: number,
-    excludeHighQualityAac = this._softwareAacFallbackTracks.has(trackKey(track)),
+    excludeAacRendition = this._softwareAacFallbackTracks.get(trackKey(track)),
   ): Promise<boolean> {
-    const source = await createMediaSession(track, { excludeHighQualityAac });
+    const nativeAacMseSupported =
+      typeof MediaSource !== "undefined" &&
+      typeof MediaSource.isTypeSupported === "function" &&
+      MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
+    const source = await createMediaSession(track, {
+      preferStandardAac: !nativeAacMseSupported,
+      excludeAacRendition,
+    });
     if (loadId !== this._loadId) return false;
     this.resetMediaSource();
 
@@ -8588,10 +8652,6 @@ class SoundCloudPlayer {
       return true;
     }
 
-    const nativeAacMseSupported =
-      typeof MediaSource !== "undefined" &&
-      typeof MediaSource.isTypeSupported === "function" &&
-      MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
     if (source.codec === "aac" && !nativeAacMseSupported) {
       let softwareAac: SoftwareAacPlayback;
       try {
@@ -8599,25 +8659,20 @@ class SoundCloudPlayer {
           mediaElement: this.audio,
           audioContext: this.ensureSoftwareAacContext(),
           sourceUrl: source.url,
+          rendition: source.aacRendition,
           durationHint: track.duration / 1_000,
-          onFatalError: (message) => {
-            if (
-              loadId === this._loadId &&
-              this.softwareAac === softwareAac
-            ) {
-              this.failPlayback(`AAC decoder: ${message}`);
-            }
+          onFatalError: (cause) => {
+            void this.handleSoftwareAacFailure(track, loadId, softwareAac, cause);
           },
         });
       } catch (cause) {
         if (loadId !== this._loadId) return false;
-        if (!excludeHighQualityAac && cause instanceof SoftwareAacDecodeError) {
-          // Some valid SoundCloud AAC 160 renditions use bitstream elements
-          // the bundled decoder cannot consume. Retry once without that
-          // rendition; remember the choice only for this track/session.
-          this._softwareAacFallbackTracks.add(trackKey(track));
+        if (excludeAacRendition === undefined && cause instanceof SoftwareAacDecodeError) {
+          // Retry only a distinct rendition, including when the preferred
+          // software-compatible source is missing or itself undecodable.
+          this._softwareAacFallbackTracks.set(trackKey(track), source.aacRendition);
           warn("player", "Retrying '%s' with alternate AAC after a decoder failure", track.title);
-          return this.attachMedia(track, loadId, true);
+          return this.attachMedia(track, loadId, source.aacRendition);
         }
         throw cause;
       }
@@ -9005,10 +9060,11 @@ class SoundCloudPlayer {
       return false;
     }
 
-    const seconds = resumePositionSeconds(
-      pending.positionMs,
-      Math.round(this.audio.duration * 1_000),
-    );
+    // A live source swap should finish the track normally, even near the end.
+    // Only a restored desktop session uses the restart-from-zero policy.
+    const seconds = pending.streamRecovery
+      ? Math.min(pending.positionMs / 1_000, Math.max(0, this.audio.duration - 0.05))
+      : resumePositionSeconds(pending.positionMs, Math.round(this.audio.duration * 1_000));
     try {
       this.audio.currentTime = seconds;
     } catch (cause) {
@@ -9717,7 +9773,11 @@ class SoundCloudPlayer {
     return {
       track: this._track,
       isPlaying: !this.audio.paused && !this.audio.ended,
-      position: duration > 0 ? this.audio.currentTime / duration : 0,
+      position: duration > 0
+        ? (this._softwareAacRecoveryLoadId === this._loadId
+          ? this.playbackResumePositionMs() / 1_000
+          : this.audio.currentTime) / duration
+        : 0,
       duration,
       volume: this.audio.volume,
       isMuted: this.audio.muted,
@@ -9752,9 +9812,12 @@ class SoundCloudPlayer {
   // ── Playback ──────────────────────────────────────────────────────────────
 
   private async startAudio(expectedLoadId = this._loadId): Promise<boolean> {
+    const softwareAac = this.softwareAac;
+    const isCurrentSource = () => expectedLoadId === this._loadId &&
+      (!softwareAac || this.softwareAac === softwareAac);
     try {
       await this.audio.play();
-      if (expectedLoadId !== this._loadId) return false;
+      if (!isCurrentSource()) return false;
       const claim = claimPlayHistoryAttempt(
         this._historyAttemptedLoadId,
         expectedLoadId,
@@ -9779,7 +9842,11 @@ class SoundCloudPlayer {
       this.emit();
       return true;
     } catch (cause) {
-      if (expectedLoadId !== this._loadId) return false;
+      if (!isCurrentSource()) return false;
+      if (this._track && softwareAac && cause instanceof SoftwareAacDecodeError) {
+        void this.handleSoftwareAacFailure(this._track, expectedLoadId, softwareAac, cause, true);
+        return false;
+      }
       const name = cause instanceof DOMException ? cause.name : "";
       if (name === "AbortError") return false;
       if (name === "NotAllowedError") {
@@ -9929,7 +9996,7 @@ class SoundCloudPlayer {
       );
       return "failed";
     } finally {
-      if (loadId === this._loadId) {
+      if (loadId === this._loadId && this._softwareAacRecoveryLoadId !== loadId) {
         if (!this._resumePendingSeek) {
           this._playRequestedWhileLoading = false;
         }
@@ -10365,6 +10432,7 @@ class SoundCloudPlayer {
   }
 
   pause(): void {
+    this._playRequestedWhileLoading = false;
     this.audio.pause();
   }
 

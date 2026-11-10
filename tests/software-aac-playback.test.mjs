@@ -135,6 +135,7 @@ function runtimeHarness(segmentCount = 1) {
       mediaElement: media,
       audioContext: context,
       sourceUrl: "https://playback.media-streaming.soundcloud.cloud/list.m3u8",
+      rendition: 96,
       onFatalError: (message) => fatal.push(message),
     },
     {
@@ -369,43 +370,70 @@ test("WASM string failures become typed AAC decode errors with their real messag
 function playerAttachHarness(create) {
   const parsed = ts.createSourceFile("player.ts", playerSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const player = parsed.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === "SoundCloudPlayer");
-  const method = player.members.find(node => node.name?.getText(parsed) === "attachMedia");
-  const code = ts.transpileModule(`class Harness { ${method.getText(parsed)} }\nreturn Harness;`, {
+  const methods = ["attachMedia", "handleSoftwareAacFailure", "playbackResumePositionMs", "applyPendingPlaybackResumeSeek", "pause"].map(name =>
+    player.members.find(node => node.name?.getText(parsed) === name).getText(parsed),
+  );
+  const code = ts.transpileModule(`class Harness { ${methods.join("\n")} }\nreturn Harness;`, {
     compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
   }).outputText;
   const requests = [];
-  const Harness = new Function("createMediaSession", "MediaSource", "SoftwareAacPlayback", "SoftwareAacDecodeError", "trackKey", "warn", code)(
+  const Harness = new Function("createMediaSession", "MediaSource", "SoftwareAacPlayback", "SoftwareAacDecodeError", "trackKey", "warn", "log", "resumePositionSeconds", code)(
     async (track, options) => {
-      requests.push({ track: track.id, fallback: options.excludeHighQualityAac });
-      return { kind: "hls", codec: "aac", url: options.excludeHighQualityAac ? "aac96" : "aac160" };
+      requests.push({ track: track.id, ...options });
+      const order = options.preferStandardAac ? [96, 160] : [160, 96];
+      const aacRendition = order.find((rendition) => rendition !== options.excludeAacRendition);
+      return { kind: "hls", codec: "aac", url: `aac${aacRendition}`, aacRendition };
     },
     { isTypeSupported: () => false },
     { create },
     software.SoftwareAacDecodeError,
     track => track.id,
     () => {},
+    () => {},
+    (positionMs, durationMs) => positionMs >= durationMs - 5000 ? 0 : positionMs / 1000,
   );
   const harness = new Harness();
-  harness.audio = {};
+  harness.audio = { paused: true, currentTime: 0, readyState: 0, pause() { this.paused = true; } };
   harness._loadId = 1;
-  harness._softwareAacFallbackTracks = new Set();
-  harness.resetMediaSource = () => {};
+  harness._softwareAacFallbackTracks = new Map();
+  harness.resetMediaSource = () => {
+    harness.softwareAac?.destroy();
+    harness.softwareAac = null;
+    harness.audio.paused = true;
+    harness.audio.currentTime = 0;
+    harness.audio.readyState = 0;
+  };
   harness.ensureSoftwareAacContext = () => ({});
+  harness.emit = () => {};
+  harness.syncSpotifyProgress = () => {};
+  harness.persistPlaybackResume = () => {};
   return { harness, requests };
 }
 
-test("AAC decode fallback retries once and remembers only the affected track", async () => {
+test("software playback starts directly with the compatible AAC rendition", async () => {
+  const opened = [];
+  const { harness, requests } = playerAttachHarness(async options => {
+    opened.push(options.rendition);
+    return { rendition: options.rendition, notifyReady() {}, destroy() {} };
+  });
+  assert.equal(await harness.attachMedia({ id: "stromae-instrumental" }, 1), true);
+  assert.deepEqual(opened, [96], "the software decoder must never start this track on AAC160 first");
+  assert.equal(requests[0].preferStandardAac, true);
+  assert.equal(requests[0].excludeAacRendition, undefined);
+});
+
+test("AAC decode fallback retries a distinct rendition and remembers only the affected track", async () => {
   let ready = 0;
   const { harness, requests } = playerAttachHarness(async options => {
-    if (options.sourceUrl === "aac160") throw new software.SoftwareAacDecodeError("invalid fill element length");
+    if (options.rendition === 96) throw new software.SoftwareAacDecodeError("invalid fill element length");
     return { notifyReady() { ready++; }, destroy() {} };
   });
-  const track = { id: "anime-trip", title: "АНИМЭ ТРИП", duration: 176060 };
+  const track = { id: "incompatible-standard", title: "AAC fallback fixture", duration: 176060 };
   assert.equal(await harness.attachMedia(track, 1), true);
-  assert.deepEqual(requests.map(r => r.fallback), [false, true]);
+  assert.deepEqual(requests.map(r => r.excludeAacRendition), [undefined, 96]);
   assert.equal(ready, 1);
   await harness.attachMedia(track, 1);
-  assert.equal(requests.at(-1).fallback, true, "replaying the affected track must start on the known working rendition");
+  assert.equal(requests.at(-1).excludeAacRendition, 96, "replaying the affected track must start on the known working rendition");
   assert.equal(harness._softwareAacFallbackTracks.has("other-track"), false);
 });
 
@@ -426,6 +454,107 @@ test("AAC fallback is bounded and does not retry networking or stale failures", 
   assert.equal(await stale.harness.attachMedia({ id: "stale" }, 1), false);
   assert.equal(stale.requests.length, 1);
   assert.equal(stale.harness._softwareAacFallbackTracks.size, 0);
+});
+
+test("a late prefetch error retains its decode type and is reported only once", async () => {
+  const runtime = runtimeHarness(7);
+  const error = new software.SoftwareAacDecodeError("invalid fill element length");
+  runtime.playback.decodeSegment = async (index) => {
+    if (index === 4) throw error;
+    return runtime.decoded(index);
+  };
+  await runtime.playback.play();
+  assert.equal(runtime.playback.paused, false);
+  await runtime.playback.prefetchAround(1, runtime.playback.operationGeneration);
+  await runtime.playback.prefetchAround(1, runtime.playback.operationGeneration);
+  assert.deepEqual(runtime.fatal, [error]);
+  runtime.playback.destroy();
+});
+
+test("late AAC failure swaps media once, resumes at the same time and keeps the queue load", async () => {
+  const track = { id: "stromae-instrumental", title: "Tous Les Mêmes", duration: 231000 };
+  const opened = [];
+  const resumes = [];
+  const failures = [];
+  const { harness, requests } = playerAttachHarness(async (options) => {
+    opened.push(options);
+    return {
+      paused: options.rendition === 160,
+      rendition: options.rendition,
+      destroy() {},
+      notifyReady() {
+        harness.audio.readyState = 4;
+        harness.audio.duration = 231;
+        harness.applyPendingPlaybackResumeSeek();
+      },
+    };
+  });
+  harness._track = track;
+  harness._historyAttemptedLoadId = 1;
+  harness.queue = [track];
+  const queue = harness.queue;
+  harness.startAudio = async (loadId) => resumes.push([loadId, harness.audio.currentTime]);
+  harness.failPlayback = (message) => failures.push(message);
+  await harness.attachMedia(track, 1);
+  // Restarting a saved near-end session is fine; a live recovery must not
+  // replay the entire track instead of finishing it.
+  harness.audio.currentTime = 227.285;
+  const error = new software.SoftwareAacDecodeError("invalid fill element length");
+  opened[0].onFatalError(error);
+  opened[0].onFatalError(error);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(requests.map(r => r.excludeAacRendition), [undefined, 96]);
+  assert.deepEqual(resumes, [[1, 227.285]]);
+  assert.deepEqual(failures, []);
+  assert.equal(harness._isLoading, false);
+  assert.equal(harness._historyAttemptedLoadId, 1);
+  assert.equal(harness.queue, queue);
+
+  opened[1].onFatalError(error);
+  assert.equal(requests.length, 2, "an alternate-rendition failure is terminal");
+  assert.match(failures[0], /invalid fill element length/);
+});
+
+test("AAC recovery honors pause and does not take over a newer track", async () => {
+  for (const change of ["paused", "pause-during-retry", "new-track"]) {
+    const gate = deferred();
+    const preparingAlternate = deferred();
+    const track = { id: "1", title: "First track", duration: 30000 };
+    let fatal;
+    let starts = 0;
+    let alternativeDestroyed = false;
+    const { harness } = playerAttachHarness(async (options) => {
+      if (options.rendition === 96) {
+        fatal = options.onFatalError;
+        return { rendition: options.rendition, paused: change === "paused", notifyReady() {}, destroy() {} };
+      }
+      preparingAlternate.resolve();
+      await gate.promise;
+      return {
+        rendition: options.rendition,
+        notifyReady() { harness.audio.readyState = 4; harness.audio.duration = 30; },
+        destroy() { alternativeDestroyed = true; },
+      };
+    });
+    harness._track = track;
+    harness.startAudio = async () => { starts++; };
+    harness.failPlayback = assert.fail;
+    await harness.attachMedia(track, 1);
+    harness.audio.currentTime = 6;
+    fatal(new software.SoftwareAacDecodeError("invalid bitstream"));
+    await preparingAlternate.promise;
+    if (change === "pause-during-retry") harness.pause();
+    if (change === "new-track") {
+      harness._loadId = 2;
+      harness._track = { id: "2" };
+    }
+    gate.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(starts, 0);
+    assert.equal(alternativeDestroyed, change === "new-track");
+    if (change !== "new-track") assert.equal(harness.audio.currentTime, 6);
+  }
 });
 
 test("bundled WASM decoder is embedded without an XPUI asset fetch", async () => {

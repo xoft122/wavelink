@@ -656,7 +656,7 @@ test("current aac_160k preset outranks aac_96k even when SoundCloud labels it SQ
   );
 });
 
-test("decoder fallback excludes AAC160 without lowering the normal playback preference", async () => {
+test("software AAC selects 96 before playback, while native AAC keeps 160", async () => {
   const id = 2126209917;
   const highPath = `/media/soundcloud:tracks:${id}/highStream16/stream/hls`;
   const lowPath = `/media/soundcloud:tracks:${id}/lowStream096/stream/hls`;
@@ -664,7 +664,8 @@ test("decoder fallback excludes AAC160 without lowering the normal playback pref
   const lowUrl = "https://playback.media-streaming.soundcloud.cloud/test-96.m3u8";
   const requests = installTransport(async request => {
     const url = targetUrl(request);
-    assert.equal(url.searchParams.has("excludeHighQualityAac"), false, "the local decoder preference must not leak into API query parameters");
+    assert.equal(url.searchParams.has("preferStandardAac"), false);
+    assert.equal(url.searchParams.has("excludeAacRendition"), false);
     if (url.pathname === `/tracks/${id}`) return { body: {
       ...rawFeedTrack(id), access: "playable", policy: "ALLOW", streamable: true,
       media: { transcodings: [
@@ -677,9 +678,16 @@ test("decoder fallback excludes AAC160 without lowering the normal playback pref
     throw new Error(`Unexpected URL: ${url.pathname}`);
   });
   direct.configureDirectSoundCloud(() => credentials);
-  assert.equal((await direct.resolveDirectMediaSource(`soundcloud:tracks:${id}`)).url, highUrl);
-  assert.equal((await direct.resolveDirectMediaSource(`soundcloud:tracks:${id}`, { excludeHighQualityAac: true })).url, lowUrl);
-  assert.deepEqual(requests.filter(r => targetUrl(r).pathname.includes("/media/")).map(r => targetUrl(r).pathname), [highPath, lowPath]);
+  const urn = `soundcloud:tracks:${id}`;
+  const native = await direct.resolveDirectMediaSource(urn);
+  const software = await direct.resolveDirectMediaSource(urn, { preferStandardAac: true });
+  const retryAfter96 = await direct.resolveDirectMediaSource(urn, { preferStandardAac: true, excludeAacRendition: 96 });
+  const retryAfter160 = await direct.resolveDirectMediaSource(urn, { preferStandardAac: true, excludeAacRendition: 160 });
+  assert.deepEqual([native.url, native.aacRendition], [highUrl, 160]);
+  assert.deepEqual([software.url, software.aacRendition], [lowUrl, 96]);
+  assert.deepEqual([retryAfter96.url, retryAfter96.aacRendition], [highUrl, 160]);
+  assert.deepEqual([retryAfter160.url, retryAfter160.aacRendition], [lowUrl, 96]);
+  assert.deepEqual(requests.filter(r => targetUrl(r).pathname.includes("/media/")).map(r => targetUrl(r).pathname), [highPath, lowPath, highPath, lowPath]);
 });
 
 test("HLS prefers AAC over MPEG for current Spotify embedded-player compatibility", async () => {

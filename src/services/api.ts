@@ -15,6 +15,7 @@ import {
 import { clearSettings, loadSettings } from "./auth";
 import {
   DirectNormalizer,
+  type DirectMediaResolveOptions,
   DirectRequestOptions,
   DirectSoundCloudCredentials,
   DirectSoundCloudError,
@@ -523,7 +524,7 @@ export async function getRelatedTracks(
 
 export async function createMediaSession(
   track: SCTrack,
-  options: { excludeHighQualityAac?: boolean } = {},
+  options: Pick<DirectMediaResolveOptions, "preferStandardAac" | "excludeAacRendition"> = {},
 ): Promise<SCMediaSource> {
   const started = performance.now();
   try {
@@ -537,8 +538,8 @@ export async function createMediaSession(
       );
     }
     const source = await createDirectMediaSource(track, {
+      ...options,
       consumerProductAvailable: getConsumerProductAvailability(),
-      excludeHighQualityAac: options.excludeHighQualityAac,
     });
     logDebug({
       ts: Date.now(),
@@ -549,6 +550,7 @@ export async function createMediaSession(
       body: {
         kind: source.kind,
         codec: source.codec,
+        ...(source.codec === "aac" ? { aacRendition: source.aacRendition } : {}),
         access: source.access,
         expiresAt: source.expiresAt,
       },

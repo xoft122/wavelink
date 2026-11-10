@@ -7,6 +7,7 @@ import {
   SOUNDKIT_WASM_SIZE,
 } from "../vendor/soundkit/soundkit_wasm_payload.js";
 import { soundCloudMediaProxyUrl } from "./directSoundcloud";
+import type { SCAacRendition } from "../types/soundcloud";
 
 const MANIFEST_LIMIT_BYTES = 2 * 1024 * 1024;
 const INIT_SEGMENT_LIMIT_BYTES = 2 * 1024 * 1024;
@@ -79,8 +80,9 @@ export interface SoftwareAacPlaybackOptions {
   mediaElement: HTMLAudioElement;
   audioContext: AudioContext;
   sourceUrl: string;
+  rendition: SCAacRendition;
   durationHint?: number;
-  onFatalError: (message: string) => void;
+  onFatalError: (error: Error) => void;
 }
 
 export interface SoftwareAacSegmentSchedule {
@@ -338,6 +340,7 @@ function mediaErrorMessage(cause: unknown): string {
 
 export class SoftwareAacPlayback {
   readonly sourceUrl: string;
+  readonly rendition: SCAacRendition;
   readonly duration: number;
   readonly readyState = 4;
   readonly playbackRate = 1;
@@ -349,7 +352,7 @@ export class SoftwareAacPlayback {
   private readonly context: AudioContext;
   private readonly gain: GainNode;
   private readonly abortController = new AbortController();
-  private readonly onFatalError: (message: string) => void;
+  private readonly onFatalError: (error: Error) => void;
   private readonly decoded = new Map<number, DecodedSegment>();
   private readonly decoding = new Map<number, Promise<DecodedSegment>>();
   private readonly scheduled = new Map<number, ScheduledSegment>();
@@ -374,6 +377,7 @@ export class SoftwareAacPlayback {
   ) {
     this.mediaElement = options.mediaElement;
     this.sourceUrl = options.sourceUrl;
+    this.rendition = options.rendition;
     this.manifest = manifest;
     this.duration =
       manifest.duration > 0
@@ -447,7 +451,7 @@ export class SoftwareAacPlayback {
     this.mediaElement.dispatchEvent(new Event("loadedmetadata"));
     this.mediaElement.dispatchEvent(new Event("durationchange"));
     this.mediaElement.dispatchEvent(new Event("canplay"));
-    void this.prefetchAround(0, this.operationGeneration);
+    void this.prefetchAround(this.segmentIndexForTime(this.currentTime), this.operationGeneration);
   }
 
   syncGain(): void {
@@ -560,7 +564,7 @@ export class SoftwareAacPlayback {
         this.buffering = false;
       }
     } catch (cause) {
-      if (!isAbortError(cause)) this.reportFatal(cause);
+      if (operation === this.operationGeneration) this.reportFatal(cause);
     }
   }
 
@@ -892,7 +896,7 @@ export class SoftwareAacPlayback {
     if (this.destroyed || this.fatalReported || isAbortError(cause)) return;
     this.fatalReported = true;
     this.error = null;
-    this.onFatalError(mediaErrorMessage(cause));
+    this.onFatalError(cause instanceof Error ? cause : new Error(mediaErrorMessage(cause)));
   }
 }
 
