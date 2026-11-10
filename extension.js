@@ -32801,7 +32801,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
     }
     return /(?:^|[_-])(?:hq|high|160)(?:k|kbps)?(?:$|[_-])/.test(preset) || /^aac[_-]1(?:$|[_-])/.test(preset);
   }
-  function transcodingRank(value) {
+  function transcodingRank(value, preferStandardAac) {
     var _a2;
     const format2 = isRecord(value.format) ? value.format : {};
     const protocol = String((_a2 = format2.protocol) != null ? _a2 : "").toLowerCase();
@@ -32810,7 +32810,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
     if (protocol === "progressive" && codec === "mp3")
       return 600;
     if (isHls && codec === "aac")
-      return isHighQualityAac(value) ? 520 : 500;
+      return isHighQualityAac(value) !== preferStandardAac ? 520 : 500;
     if (isHls && codec === "mp3")
       return 400;
     return -1;
@@ -32916,7 +32916,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
     }
     return null;
   }
-  async function resolveStreamsFromTrack(rawTrack, expectedTrackId, options, consumerProductAvailable, excludeHighQualityAac = false) {
+  async function resolveStreamsFromTrack(rawTrack, expectedTrackId, options, consumerProductAvailable, preferStandardAac = false, excludeAacRendition) {
     const policy = typeof rawTrack.policy === "string" ? rawTrack.policy.trim().toUpperCase() : "";
     if (rawTrack.access === "blocked" || policy === "BLOCK") {
       throw new DirectSoundCloudError(
@@ -32957,11 +32957,11 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
     }
     const candidates = transcodings.map((transcoding) => ({
       transcoding,
-      rank: transcodingRank(transcoding),
+      rank: transcodingRank(transcoding, preferStandardAac),
       field: streamField(transcoding),
       fullness: transcoding.snipped === false ? 2 : transcoding.snipped === true ? 0 : 1
     })).filter(
-      (candidate) => candidate.rank >= 0 && candidate.field !== null && !(excludeHighQualityAac && candidate.field === "hls_aac_160_url")
+      (candidate) => candidate.rank >= 0 && candidate.field !== null && !(excludeAacRendition === 160 && candidate.field === "hls_aac_160_url") && !(excludeAacRendition === 96 && candidate.field === "hls_aac_96_url")
     ).sort(
       (left, right) => right.fullness - left.fullness || right.rank - left.rank
     );
@@ -33006,10 +33006,12 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
   async function resolveDirectTrackStreams(urn, options = {}) {
     const _a2 = options, {
       consumerProductAvailable,
-      excludeHighQualityAac
+      preferStandardAac,
+      excludeAacRendition
     } = _a2, requestOptions = __objRest(_a2, [
       "consumerProductAvailable",
-      "excludeHighQualityAac"
+      "preferStandardAac",
+      "excludeAacRendition"
     ]);
     const trackId = soundCloudNumericId(urn, "track");
     const track = await directSoundCloudRequest(
@@ -33028,7 +33030,8 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
       trackId,
       requestOptions,
       consumerProductAvailable,
-      excludeHighQualityAac
+      preferStandardAac,
+      excludeAacRendition
     );
     return { track, streams };
   }
@@ -33114,13 +33117,17 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
         "expired_media_url"
       );
     }
-    return {
-      kind: progressive ? "progressive" : "hls",
-      codec: progressive ? "mp3" : streams.hls_aac_160_url === selected || streams.hls_aac_96_url === selected ? "aac" : "mp3",
-      url: mediaUrl.toString(),
-      expiresAt,
-      access
-    };
+    const media = { url: mediaUrl.toString(), expiresAt, access };
+    if (progressive)
+      return __spreadProps(__spreadValues({}, media), { kind: "progressive", codec: "mp3" });
+    if (streams.hls_aac_160_url || streams.hls_aac_96_url) {
+      return __spreadProps(__spreadValues({}, media), {
+        kind: "hls",
+        codec: "aac",
+        aacRendition: streams.hls_aac_160_url ? 160 : 96
+      });
+    }
+    return __spreadProps(__spreadValues({}, media), { kind: "hls", codec: "mp3" });
   }
   var SOUNDCLOUD_API_V2_BASE, SPICETIFY_CORS_PROXY_ORIGIN, ALLOWED_API_HOSTS, ALLOWED_LEGACY_API_PATHS, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MAX_URL_LENGTH, MAX_TOKEN_LENGTH, MAX_QUERY_PARAMETERS, DEFAULT_MEDIA_TTL_MS, configuredCredentialProvider, configuredUnauthorizedHandler, DirectSoundCloudError, trackEntityNormalizer, playlistEntityNormalizer, likedPlaylistEntityNormalizer, userEntityNormalizer, createDirectMediaSource;
   var init_directSoundcloud = __esm({
@@ -33689,7 +33696,7 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
   var init_version = __esm({
     "src/version.ts"() {
       "use strict";
-      WAVELINK_VERSION = "3.0.85";
+      WAVELINK_VERSION = "3.0.87";
     }
   });
 
@@ -34012,22 +34019,22 @@ Schedule: ${scheduleItems.map((seg) => segmentToString(seg))} pos: ${this.timeli
           track.authorization_geo
         );
       }
-      const source = await createDirectMediaSource(track, {
-        consumerProductAvailable: getConsumerProductAvailability(),
-        excludeHighQualityAac: options.excludeHighQualityAac
-      });
+      const source = await createDirectMediaSource(track, __spreadProps(__spreadValues({}, options), {
+        consumerProductAvailable: getConsumerProductAvailability()
+      }));
       logDebug({
         ts: Date.now(),
         method: "GET",
         endpoint: "/media/resolve",
         status: 200,
         durationMs: Math.round(performance.now() - started),
-        body: {
+        body: __spreadProps(__spreadValues({
           kind: source.kind,
-          codec: source.codec,
+          codec: source.codec
+        }, source.codec === "aac" ? { aacRendition: source.aacRendition } : {}), {
           access: source.access,
           expiresAt: source.expiresAt
-        }
+        })
       });
       return source;
     } catch (cause) {
@@ -37231,6 +37238,7 @@ ${val.stack}`;
           this._ended = false;
           this.mediaElement = options.mediaElement;
           this.sourceUrl = options.sourceUrl;
+          this.rendition = options.rendition;
           this.manifest = manifest;
           this.duration = manifest.duration > 0 ? manifest.duration : Math.max(0, Number(options.durationHint) || 0);
           this.initBytes = initBytes;
@@ -37294,7 +37302,7 @@ ${val.stack}`;
           this.mediaElement.dispatchEvent(new Event("loadedmetadata"));
           this.mediaElement.dispatchEvent(new Event("durationchange"));
           this.mediaElement.dispatchEvent(new Event("canplay"));
-          void this.prefetchAround(0, this.operationGeneration);
+          void this.prefetchAround(this.segmentIndexForTime(this.currentTime), this.operationGeneration);
         }
         syncGain() {
           if (this.destroyed)
@@ -37399,7 +37407,7 @@ ${val.stack}`;
               this.buffering = false;
             }
           } catch (cause) {
-            if (!isAbortError(cause))
+            if (operation === this.operationGeneration)
               this.reportFatal(cause);
           }
         }
@@ -37709,7 +37717,7 @@ ${val.stack}`;
             return;
           this.fatalReported = true;
           this.error = null;
-          this.onFatalError(mediaErrorMessage(cause));
+          this.onFatalError(cause instanceof Error ? cause : new Error(mediaErrorMessage(cause)));
         }
       };
     }
@@ -40617,7 +40625,8 @@ ${val.stack}`;
         constructor() {
           this.hls = null;
           this.softwareAac = null;
-          this._softwareAacFallbackTracks = /* @__PURE__ */ new Set();
+          this._softwareAacFallbackTracks = /* @__PURE__ */ new Map();
+          this._softwareAacRecoveryLoadId = null;
           this.softwareAacContext = null;
           this._track = null;
           this._isLoading = false;
@@ -47438,8 +47447,60 @@ ${val.stack}`;
           }
           this.emit();
         }
-        async attachMedia(track, loadId, excludeHighQualityAac = this._softwareAacFallbackTracks.has(trackKey(track))) {
-          const source = await createMediaSession(track, { excludeHighQualityAac });
+        async handleSoftwareAacFailure(track, loadId, playback, cause, requestPlay = false) {
+          if (loadId !== this._loadId || this.softwareAac !== playback)
+            return;
+          const key = trackKey(track);
+          if (!(cause instanceof SoftwareAacDecodeError) || this._softwareAacFallbackTracks.has(key)) {
+            this._resumePendingSeek = null;
+            this._playRequestedWhileLoading = false;
+            this.failPlayback(`AAC decoder: ${cause.message}`);
+            return;
+          }
+          this._resumePendingSeek = {
+            loadId,
+            trackKey: key,
+            positionMs: this.playbackResumePositionMs(),
+            streamRecovery: true
+          };
+          this._playRequestedWhileLoading = requestPlay || this._playRequestedWhileLoading || !playback.paused;
+          this._softwareAacFallbackTracks.set(key, playback.rendition);
+          this._softwareAacRecoveryLoadId = loadId;
+          this._isLoading = true;
+          warn("player", "Switching '%s' to alternate AAC after a decoder failure", track.title);
+          try {
+            this.resetMediaSource();
+            if (loadId !== this._loadId)
+              return;
+            this.emit();
+            if (loadId !== this._loadId)
+              return;
+            if (!await this.attachMedia(track, loadId, playback.rendition) || loadId !== this._loadId)
+              return;
+            this.applyPendingPlaybackResumeSeek();
+          } catch (error2) {
+            if (loadId !== this._loadId)
+              return;
+            this._resumePendingSeek = null;
+            this._playRequestedWhileLoading = false;
+            const detail = error2 instanceof Error ? error2.message : cause.message;
+            this.failPlayback(`AAC decoder: ${detail}`);
+          } finally {
+            if (this._softwareAacRecoveryLoadId === loadId) {
+              this._softwareAacRecoveryLoadId = null;
+            }
+            if (loadId === this._loadId) {
+              this._isLoading = false;
+              this.emit();
+            }
+          }
+        }
+        async attachMedia(track, loadId, excludeAacRendition = this._softwareAacFallbackTracks.get(trackKey(track))) {
+          const nativeAacMseSupported = typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function" && MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
+          const source = await createMediaSession(track, {
+            preferStandardAac: !nativeAacMseSupported,
+            excludeAacRendition
+          });
           if (loadId !== this._loadId)
             return false;
           this.resetMediaSource();
@@ -47449,7 +47510,6 @@ ${val.stack}`;
             this.audio.load();
             return true;
           }
-          const nativeAacMseSupported = typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function" && MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
           if (source.codec === "aac" && !nativeAacMseSupported) {
             let softwareAac;
             try {
@@ -47457,20 +47517,19 @@ ${val.stack}`;
                 mediaElement: this.audio,
                 audioContext: this.ensureSoftwareAacContext(),
                 sourceUrl: source.url,
+                rendition: source.aacRendition,
                 durationHint: track.duration / 1e3,
-                onFatalError: (message) => {
-                  if (loadId === this._loadId && this.softwareAac === softwareAac) {
-                    this.failPlayback(`AAC decoder: ${message}`);
-                  }
+                onFatalError: (cause) => {
+                  void this.handleSoftwareAacFailure(track, loadId, softwareAac, cause);
                 }
               });
             } catch (cause) {
               if (loadId !== this._loadId)
                 return false;
-              if (!excludeHighQualityAac && cause instanceof SoftwareAacDecodeError) {
-                this._softwareAacFallbackTracks.add(trackKey(track));
+              if (excludeAacRendition === void 0 && cause instanceof SoftwareAacDecodeError) {
+                this._softwareAacFallbackTracks.set(trackKey(track), source.aacRendition);
                 warn("player", "Retrying '%s' with alternate AAC after a decoder failure", track.title);
-                return this.attachMedia(track, loadId, true);
+                return this.attachMedia(track, loadId, source.aacRendition);
               }
               throw cause;
             }
@@ -47805,10 +47864,7 @@ ${val.stack}`;
           if (this.audio.readyState < 1 || !Number.isFinite(this.audio.duration) || this.audio.duration <= 0) {
             return false;
           }
-          const seconds = resumePositionSeconds(
-            pending.positionMs,
-            Math.round(this.audio.duration * 1e3)
-          );
+          const seconds = pending.streamRecovery ? Math.min(pending.positionMs / 1e3, Math.max(0, this.audio.duration - 0.05)) : resumePositionSeconds(pending.positionMs, Math.round(this.audio.duration * 1e3));
           try {
             this.audio.currentTime = seconds;
           } catch (cause) {
@@ -48374,7 +48430,7 @@ ${val.stack}`;
           return {
             track: this._track,
             isPlaying: !this.audio.paused && !this.audio.ended,
-            position: duration > 0 ? this.audio.currentTime / duration : 0,
+            position: duration > 0 ? (this._softwareAacRecoveryLoadId === this._loadId ? this.playbackResumePositionMs() / 1e3 : this.audio.currentTime) / duration : 0,
             duration,
             volume: this.audio.volume,
             isMuted: this.audio.muted,
@@ -48404,9 +48460,11 @@ ${val.stack}`;
         }
         async startAudio(expectedLoadId = this._loadId) {
           var _a2, _b, _c;
+          const softwareAac = this.softwareAac;
+          const isCurrentSource = () => expectedLoadId === this._loadId && (!softwareAac || this.softwareAac === softwareAac);
           try {
             await this.audio.play();
-            if (expectedLoadId !== this._loadId)
+            if (!isCurrentSource())
               return false;
             const claim = claimPlayHistoryAttempt(
               this._historyAttemptedLoadId,
@@ -48432,8 +48490,12 @@ ${val.stack}`;
             this.emit();
             return true;
           } catch (cause) {
-            if (expectedLoadId !== this._loadId)
+            if (!isCurrentSource())
               return false;
+            if (this._track && softwareAac && cause instanceof SoftwareAacDecodeError) {
+              void this.handleSoftwareAacFailure(this._track, expectedLoadId, softwareAac, cause, true);
+              return false;
+            }
             const name = cause instanceof DOMException ? cause.name : "";
             if (name === "AbortError")
               return false;
@@ -48566,7 +48628,7 @@ ${val.stack}`;
             );
             return "failed";
           } finally {
-            if (loadId === this._loadId) {
+            if (loadId === this._loadId && this._softwareAacRecoveryLoadId !== loadId) {
               if (!this._resumePendingSeek) {
                 this._playRequestedWhileLoading = false;
               }
@@ -48944,6 +49006,7 @@ ${val.stack}`;
           await this.startAudio();
         }
         pause() {
+          this._playRequestedWhileLoading = false;
           this.audio.pause();
         }
         toggle() {
