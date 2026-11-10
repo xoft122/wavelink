@@ -421,6 +421,7 @@ test("media resolution prefers a validated progressive SoundCloud CDN URL", asyn
 
   const source = await direct.resolveDirectMediaSource("soundcloud:tracks:123");
   assert.equal(source.kind, "progressive");
+  assert.equal(source.codec, "mp3");
   assert.equal(source.access, "playable");
   assert.match(source.url, /^https:\/\/cf-media\.sndcdn\.com\/test\.mp3/);
   assert.equal(requests.length, 2);
@@ -538,7 +539,7 @@ test("SNIP playback is a preview unless the consumer product is explicitly unava
   );
 });
 
-test("HLS accepts the exact SoundCloud streaming host and selects HQ AAC over SQ AAC", async () => {
+test("HLS accepts the exact SoundCloud streaming host and resolves HQ AAC before SQ AAC", async () => {
   const highPath = "/media/soundcloud:tracks:456/highAAC123/stream/hls";
   const lowPath = "/media/soundcloud:tracks:456/lowAAC1234/stream/hls";
   const highUrl =
@@ -587,19 +588,106 @@ test("HLS accepts the exact SoundCloud streaming host and selects HQ AAC over SQ
 
   const source = await direct.resolveDirectMediaSource("soundcloud:tracks:456");
   assert.equal(source.kind, "hls");
+  assert.equal(source.codec, "aac");
   assert.equal(source.url, highUrl);
   assert.deepEqual(
     requests.slice(1).map((request) => targetUrl(request).pathname),
-    [highPath, lowPath],
+    [highPath],
+    "a valid HQ AAC stream makes the lower-quality resolver unnecessary",
   );
 });
 
-test("HLS prefers MPEG audio over AAC for Spotify embedded-player compatibility", async () => {
+test("current aac_160k preset outranks aac_96k even when SoundCloud labels it SQ", async () => {
+  const lowPath = "/media/soundcloud:tracks:457/aac96Path/stream/hls";
+  const highPath = "/media/soundcloud:tracks:457/aac160Path/stream/hls";
+  const lowUrl =
+    "https://playback.media-streaming.soundcloud.cloud/current-aac/96.m3u8";
+  const highUrl =
+    "https://playback.media-streaming.soundcloud.cloud/current-aac/160.m3u8";
+  const requests = installTransport(async (request) => {
+    const url = targetUrl(request);
+    if (url.pathname.endsWith("/tracks/457")) {
+      return {
+        status: 200,
+        body: {
+          id: 457,
+          urn: "soundcloud:tracks:457",
+          access: "playable",
+          streamable: true,
+          media: {
+            // This is the current API ordering and metadata: `quality` no
+            // longer distinguishes the bitrates, while the preset does.
+            transcodings: [
+              {
+                url: `https://api-v2.soundcloud.com${lowPath}`,
+                preset: "aac_96k",
+                quality: "lq",
+                format: { protocol: "hls", mime_type: "audio/mp4" },
+              },
+              {
+                url: `https://api-v2.soundcloud.com${highPath}`,
+                preset: "aac_160k",
+                quality: "sq",
+                format: { protocol: "hls", mime_type: "audio/mp4" },
+              },
+            ],
+          },
+        },
+      };
+    }
+    if (url.pathname.endsWith(lowPath)) {
+      return { status: 200, body: { url: lowUrl } };
+    }
+    if (url.pathname.endsWith(highPath)) {
+      return { status: 200, body: { url: highUrl } };
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  });
+  direct.configureDirectSoundCloud(() => credentials);
+
+  const source = await direct.resolveDirectMediaSource("soundcloud:tracks:457");
+  assert.equal(source.kind, "hls");
+  assert.equal(source.codec, "aac");
+  assert.equal(source.url, highUrl);
+  assert.deepEqual(
+    requests.slice(1).map((request) => targetUrl(request).pathname),
+    [highPath],
+    "aac_160k must be resolved first despite its generic SQ quality label",
+  );
+});
+
+test("decoder fallback excludes AAC160 without lowering the normal playback preference", async () => {
+  const id = 2126209917;
+  const highPath = `/media/soundcloud:tracks:${id}/highStream16/stream/hls`;
+  const lowPath = `/media/soundcloud:tracks:${id}/lowStream096/stream/hls`;
+  const highUrl = "https://playback.media-streaming.soundcloud.cloud/test-160.m3u8";
+  const lowUrl = "https://playback.media-streaming.soundcloud.cloud/test-96.m3u8";
+  const requests = installTransport(async request => {
+    const url = targetUrl(request);
+    assert.equal(url.searchParams.has("excludeHighQualityAac"), false, "the local decoder preference must not leak into API query parameters");
+    if (url.pathname === `/tracks/${id}`) return { body: {
+      ...rawFeedTrack(id), access: "playable", policy: "ALLOW", streamable: true,
+      media: { transcodings: [
+        { preset: "aac_160k", quality: "sq", snipped: false, url: `https://api-v2.soundcloud.com${highPath}`, format: { protocol: "hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' } },
+        { preset: "aac_96k", quality: "lq", snipped: false, url: `https://api-v2.soundcloud.com${lowPath}`, format: { protocol: "hls", mime_type: 'audio/mp4; codecs="mp4a.40.2"' } },
+      ] },
+    } };
+    if (url.pathname === highPath) return { body: { url: highUrl } };
+    if (url.pathname === lowPath) return { body: { url: lowUrl } };
+    throw new Error(`Unexpected URL: ${url.pathname}`);
+  });
+  direct.configureDirectSoundCloud(() => credentials);
+  assert.equal((await direct.resolveDirectMediaSource(`soundcloud:tracks:${id}`)).url, highUrl);
+  assert.equal((await direct.resolveDirectMediaSource(`soundcloud:tracks:${id}`, { excludeHighQualityAac: true })).url, lowUrl);
+  assert.deepEqual(requests.filter(r => targetUrl(r).pathname.includes("/media/")).map(r => targetUrl(r).pathname), [highPath, lowPath]);
+});
+
+test("HLS prefers AAC over MPEG for current Spotify embedded-player compatibility", async () => {
   const aacPath = "/media/soundcloud:tracks:654/aacStream9/stream/hls";
   const mp3Path = "/media/soundcloud:tracks:654/mp3Stream/stream/hls";
   const aacUrl = "https://playback.media-streaming.soundcloud.cloud/aac/playlist.m3u8";
   const mp3Url = "https://cf-hls-media.sndcdn.com/mp3/playlist.m3u8";
-  installTransport(async (request) => {
+  const requests = installTransport(async (request) => {
     const url = targetUrl(request);
     if (url.pathname.endsWith("/tracks/654")) {
       return {
@@ -636,7 +724,276 @@ test("HLS prefers MPEG audio over AAC for Spotify embedded-player compatibility"
 
   const source = await direct.resolveDirectMediaSource("soundcloud:tracks:654");
   assert.equal(source.kind, "hls");
+  assert.equal(source.codec, "aac");
+  assert.equal(source.url, aacUrl);
+  assert.deepEqual(
+    requests.slice(1).map((request) => targetUrl(request).pathname),
+    [aacPath],
+    "the legacy MPEG fallback must not be resolved when AAC succeeds",
+  );
+});
+
+test("HLS resolves Spotify-compatible AAC before an unusable MPEG fallback", async () => {
+  const aacPath = "/media/soundcloud:tracks:655/aacStream9/stream/hls";
+  const mp3Path = "/media/soundcloud:tracks:655/mp3Stream/stream/hls";
+  const aacUrl =
+    "https://playback.media-streaming.soundcloud.cloud/aac-first/playlist.m3u8";
+  const requests = installTransport(async (request) => {
+    const url = targetUrl(request);
+    if (url.pathname.endsWith("/tracks/655")) {
+      return {
+        status: 200,
+        body: {
+          id: 655,
+          urn: "soundcloud:tracks:655",
+          access: "playable",
+          streamable: true,
+          media: {
+            transcodings: [
+              {
+                url: `https://api-v2.soundcloud.com${aacPath}`,
+                preset: "aac_0_1",
+                quality: "hq",
+                format: { protocol: "hls", mime_type: "audio/mp4" },
+              },
+              {
+                url: `https://api-v2.soundcloud.com${mp3Path}`,
+                preset: "mp3_0_1",
+                quality: "sq",
+                format: { protocol: "hls", mime_type: "audio/mpeg" },
+              },
+            ],
+          },
+        },
+      };
+    }
+    if (url.pathname.endsWith(aacPath)) {
+      return { status: 200, body: { url: aacUrl } };
+    }
+    if (url.pathname.endsWith(mp3Path)) {
+      // Spotify's current CEF can report bufferAddCodecError for this legacy
+      // fallback. Its independent resolver failure must not invalidate an AAC
+      // stream that was already resolved successfully.
+      return { status: 500, body: { error: "MPEG unavailable" } };
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  });
+  direct.configureDirectSoundCloud(() => credentials);
+
+  const source = await direct.resolveDirectMediaSource("soundcloud:tracks:655");
+  assert.equal(source.kind, "hls");
+  assert.equal(source.codec, "aac");
+  assert.equal(source.url, aacUrl);
+  assert.deepEqual(
+    requests.slice(1).map((request) => targetUrl(request).pathname),
+    [aacPath],
+    "an available AAC HLS stream should make the legacy MPEG request unnecessary",
+  );
+});
+
+test("HLS retains an MPEG-only fallback when SoundCloud exposes no AAC", async () => {
+  const mp3Path = "/media/soundcloud:tracks:656/mp3Stream/stream/hls";
+  const mp3Url = "https://cf-hls-media.sndcdn.com/mp3-only/playlist.m3u8";
+  const requests = installTransport(async (request) => {
+    const url = targetUrl(request);
+    if (url.pathname.endsWith("/tracks/656")) {
+      return {
+        status: 200,
+        body: {
+          id: 656,
+          urn: "soundcloud:tracks:656",
+          access: "playable",
+          streamable: true,
+          media: {
+            transcodings: [{
+              url: `https://api-v2.soundcloud.com${mp3Path}`,
+              preset: "mp3_0_1",
+              quality: "sq",
+              format: { protocol: "hls", mime_type: "audio/mpeg" },
+            }],
+          },
+        },
+      };
+    }
+    if (url.pathname.endsWith(mp3Path)) {
+      return { status: 200, body: { url: mp3Url } };
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  });
+  direct.configureDirectSoundCloud(() => credentials);
+
+  const source = await direct.resolveDirectMediaSource("soundcloud:tracks:656");
+  assert.equal(source.kind, "hls");
+  assert.equal(source.codec, "mp3");
   assert.equal(source.url, mp3Url);
+  assert.deepEqual(
+    requests.slice(1).map((request) => targetUrl(request).pathname),
+    [mp3Path],
+  );
+});
+
+test("SoundCloud abr_sq playlist metadata is not mistaken for MP3 when AAC160 is available", async () => {
+  const abrPath = "/media/soundcloud:tracks:657/abrStream9/stream/hls";
+  const aacPath = "/media/soundcloud:tracks:657/aacStream9/stream/hls";
+  const aacUrl =
+    "https://playback.media-streaming.soundcloud.cloud/abr-contract/aac-160.m3u8";
+  const requests = installTransport(async (request) => {
+    const url = targetUrl(request);
+    if (url.pathname.endsWith("/tracks/657")) {
+      return {
+        status: 200,
+        body: {
+          id: 657,
+          urn: "soundcloud:tracks:657",
+          access: "playable",
+          streamable: true,
+          media: {
+            transcodings: [
+              {
+                url: `https://api-v2.soundcloud.com${abrPath}`,
+                preset: "abr_sq",
+                quality: "sq",
+                format: { protocol: "hls", mime_type: "audio/mpegurl" },
+              },
+              {
+                url: `https://api-v2.soundcloud.com${aacPath}`,
+                preset: "aac_0_1",
+                quality: "hq",
+                format: { protocol: "hls", mime_type: "audio/mp4" },
+              },
+            ],
+          },
+        },
+      };
+    }
+    if (url.pathname.endsWith(aacPath)) {
+      return { status: 200, body: { url: aacUrl } };
+    }
+    if (url.pathname.endsWith(abrPath)) {
+      throw new Error("abr_sq must not be resolved as an MP3 stream");
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  });
+  direct.configureDirectSoundCloud(() => credentials);
+
+  const source = await direct.resolveDirectMediaSource("soundcloud:tracks:657");
+  assert.equal(source.kind, "hls");
+  assert.equal(source.codec, "aac");
+  assert.equal(source.url, aacUrl);
+  assert.deepEqual(
+    requests.slice(1).map((request) => targetUrl(request).pathname),
+    [aacPath],
+  );
+});
+
+test("AAC96 is tried after AAC160 fails while abr_sq remains ignored", async () => {
+  const abrPath = "/media/soundcloud:tracks:658/abrStream9/stream/hls";
+  const highPath = "/media/soundcloud:tracks:658/highAAC12/stream/hls";
+  const lowPath = "/media/soundcloud:tracks:658/lowAAC123/stream/hls";
+  const lowUrl =
+    "https://playback.media-streaming.soundcloud.cloud/abr-contract/aac-96.m3u8";
+  const requests = installTransport(async (request) => {
+    const url = targetUrl(request);
+    if (url.pathname.endsWith("/tracks/658")) {
+      return {
+        status: 200,
+        body: {
+          id: 658,
+          urn: "soundcloud:tracks:658",
+          access: "playable",
+          streamable: true,
+          media: {
+            transcodings: [
+              {
+                url: `https://api-v2.soundcloud.com${abrPath}`,
+                preset: "abr_sq",
+                quality: "sq",
+                format: { protocol: "hls", mime_type: "audio/mpegurl" },
+              },
+              {
+                url: `https://api-v2.soundcloud.com${lowPath}`,
+                preset: "aac_0_1",
+                quality: "sq",
+                format: { protocol: "hls", mime_type: "audio/mp4" },
+              },
+              {
+                url: `https://api-v2.soundcloud.com${highPath}`,
+                preset: "aac_0_1",
+                quality: "hq",
+                format: { protocol: "hls", mime_type: "audio/mp4" },
+              },
+            ],
+          },
+        },
+      };
+    }
+    if (url.pathname.endsWith(highPath)) {
+      return { status: 404, body: { error: "HQ unavailable" } };
+    }
+    if (url.pathname.endsWith(lowPath)) {
+      return { status: 200, body: { url: lowUrl } };
+    }
+    if (url.pathname.endsWith(abrPath)) {
+      throw new Error("abr_sq must stay outside the codec fallback chain");
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  });
+  direct.configureDirectSoundCloud(() => credentials);
+
+  const source = await direct.resolveDirectMediaSource("soundcloud:tracks:658");
+  assert.equal(source.kind, "hls");
+  assert.equal(source.codec, "aac");
+  assert.equal(source.url, lowUrl);
+  assert.deepEqual(
+    requests.slice(1).map((request) => targetUrl(request).pathname),
+    [highPath, lowPath],
+  );
+});
+
+test("unknown abr_sq HLS alone is rejected as stream_unavailable without resolving it", async () => {
+  const abrPath = "/media/soundcloud:tracks:659/abrStream9/stream/hls";
+  const requests = installTransport(async (request) => {
+    const url = targetUrl(request);
+    if (url.pathname.endsWith("/tracks/659")) {
+      return {
+        status: 200,
+        body: {
+          id: 659,
+          urn: "soundcloud:tracks:659",
+          access: "playable",
+          streamable: true,
+          media: {
+            transcodings: [{
+              url: `https://api-v2.soundcloud.com${abrPath}`,
+              preset: "abr_sq",
+              quality: "sq",
+              format: { protocol: "hls", mime_type: "audio/mpegurl" },
+            }],
+          },
+        },
+      };
+    }
+    if (url.pathname.endsWith(abrPath)) {
+      return {
+        status: 200,
+        body: {
+          url: "https://cf-hls-media.sndcdn.com/abr-contract/unknown.m3u8",
+        },
+      };
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  });
+  direct.configureDirectSoundCloud(() => credentials);
+
+  await assert.rejects(
+    direct.resolveDirectMediaSource("soundcloud:tracks:659"),
+    (error) => error.code === "stream_unavailable" && error.status === 502,
+  );
+  assert.equal(
+    requests.length,
+    1,
+    "an unknown playlist MIME is not a codec and must not reach its resolver",
+  );
 });
 
 test("HLS rejects lookalike subdomains of the exact SoundCloud streaming host", async () => {

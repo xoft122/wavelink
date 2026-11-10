@@ -38,6 +38,7 @@ test("classifies only the stale Spotify now-playing actions", () => {
     ["Share track", "spotify-share"],
     ["Share this song", "spotify-share"],
     ["More options", "spotify-more"],
+    ["More", "spotify-more"],
     ["More options for this song", "spotify-more"],
     ["More options for cachalot", "spotify-more"],
   ];

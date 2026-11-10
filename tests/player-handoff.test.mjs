@@ -746,7 +746,8 @@ test("WaveLink covers, bar/panel metadata, and cinema suppress stale Spotify men
   assert.match(handler, /track-visual-enhancement/);
   assert.match(handler, /\.main-nowPlayingView-coverArtVisualEnhancement/);
   assert.match(handler, /\.main-nowPlayingView-coverArtContainer/);
-  assert.match(handler, /\.Root__cinema-view/);
+  assert.match(handler, /closest\(CINEMA_ROOT_SELECTOR\)/);
+  assert.match(playerSource, /CINEMA_ROOT_SELECTOR = "\.Root__cinema-view, \[data-wl-cinema-root\]"/);
   assert.match(
     handler,
     /closest\(\s*["']\.wl-sc-meta-host\.wl-sc-meta-bar["']\s*,?\s*\)/,

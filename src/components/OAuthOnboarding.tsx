@@ -2,6 +2,25 @@ import React from "react";
 
 import { WebSessionForm } from "./WebSessionForm";
 
+const NETWORK_FILTER = "api-v2.soundcloud.com";
+
+async function copyNetworkFilter() {
+  const spotify = window.Spicetify;
+  try {
+    try {
+      await navigator.clipboard.writeText(NETWORK_FILTER);
+    } catch (error) {
+      const clipboard = spotify?.Platform?.ClipboardAPI;
+      if (!clipboard?.copy) throw error;
+      await clipboard.copy(NETWORK_FILTER);
+    }
+  } catch {
+    spotify?.showNotification("Couldn't copy the filter. Select and copy it manually.", true);
+    return;
+  }
+  spotify?.showNotification("Network filter copied.");
+}
+
 interface Props {
   isConnecting: boolean;
   error: string | null;
@@ -104,7 +123,16 @@ export function OAuthOnboarding({
                   <strong>Find an API request.</strong>{" "}
                   <span>
                     Open <strong>Network</strong>, filter by{" "}
-                    <code>api-v2.soundcloud.com</code>, then reload.
+                    <span className="wl-onboarding__network-filter">
+                      <code>{NETWORK_FILTER}</code>
+                      <button
+                        type="button"
+                        aria-label="Copy SoundCloud Network filter"
+                        onClick={copyNetworkFilter}
+                      >
+                        Copy
+                      </button>
+                    </span>, then reload.
                   </span>
                 </span>
               </li>

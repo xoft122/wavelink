@@ -357,6 +357,71 @@ test("cinema artwork follows native geometry through a compositor transform", ()
   }
 });
 
+test("fullscreen entry rejects a falling cover and never measures a WaveLink overlay", async () => {
+  const source = await readFile(new URL("../src/services/player.ts", import.meta.url), "utf8");
+  const parsed = ts.createSourceFile("player.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const player = parsed.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === "SoundCloudPlayer");
+  const method = player.members.find(node => node.name?.getText(parsed) === "syncCinemaArtworkCoverGeometry");
+  const setter = parsed.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "setStylePropertyIfChanged");
+  const code = ts.transpileModule(`${setter.getText(parsed)}\nclass Harness { ${method.getText(parsed)} }\nreturn Harness;`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  const Harness = new Function("window", "cinemaArtworkCoverTransform", code)(
+    { getComputedStyle: () => ({ borderRadius: "8px" }) },
+    artistMode.cinemaArtworkCoverTransform,
+  );
+  const rect = (left, top, width, height = width) => ({ left, top, width, height, right: left + width, bottom: top + height });
+  const image = (bounds, owned = false) => ({
+    bounds, isConnected: true,
+    matches: () => !owned,
+    closest: () => owned ? {} : null,
+    getBoundingClientRect() { return this.bounds; },
+  });
+  const native = image(rect(400, 650, 400));
+  const duplicate = image(rect(300, 100, 600), true);
+  const classes = new Set(["is-native-aligned"]);
+  const properties = new Map([["--wl-cinema-cover-y", "650px"]]);
+  const binding = {
+    root: {
+      dataset: { wlCinemaMode: "artwork" },
+      contains: element => [native, duplicate].includes(element),
+      querySelectorAll: () => [duplicate, native],
+    },
+    artworkBackground: { hidden: false, getBoundingClientRect: () => rect(0, 0, 1200, 800) },
+    artworkCover: {
+      classList: { add: value => classes.add(value), remove: value => classes.delete(value) },
+      style: {
+        getPropertyValue: name => properties.get(name) ?? "",
+        setProperty: (name, value) => properties.set(name, value),
+        removeProperty: name => properties.delete(name),
+      },
+    },
+    scrollViewport: { scrollTop: 0 },
+    nativeArtworkCover: duplicate,
+    artworkCoverBaseWidth: 600,
+    artworkCoverBaseHeight: 600,
+  };
+  const harness = new Harness();
+  harness.syncCinemaArtworkCoverGeometry(binding);
+  assert.equal(binding.nativeArtworkCover, null, "entering artwork below the viewport must use the centered fallback");
+  assert.equal(classes.has("is-native-aligned"), false);
+  assert.equal(properties.has("--wl-cinema-cover-y"), false);
+
+  native.bounds = rect(400, 160, 400);
+  harness.syncCinemaArtworkCoverGeometry(binding);
+  assert.equal(binding.nativeArtworkCover, native, "settled geometry must use the untouched native image");
+  assert.equal(properties.get("--wl-cinema-cover-y"), "160px");
+
+  native.bounds = rect(500, 500, 200);
+  harness.syncCinemaArtworkCoverGeometry(binding);
+  assert.equal(binding.nativeArtworkCover, null, "a fully visible but bottom-aligned entering cover is not the final layout");
+
+  binding.scrollViewport.scrollTop = 220;
+  native.bounds = rect(400, -100, 400);
+  harness.syncCinemaArtworkCoverGeometry(binding);
+  assert.equal(properties.get("--wl-cinema-cover-y"), "-100px", "normal artwork scrolling must remain supported");
+});
+
 test("artwork panels follow scroll position and disappear completely at the top", () => {
   const base = {
     active: true,
@@ -1130,7 +1195,7 @@ test("Show artwork owns a color-matched background with guarded lifecycle", asyn
   );
   assert.match(
     playerSource,
-    /querySelectorAll<HTMLImageElement>\(\s*"img\.wl-sc-cover:not\(\[data-wl-owned\]\)"/,
+    /querySelectorAll<HTMLImageElement>\(\s*"img:not\(\[data-wl-owned\]\)"/,
   );
   assert.match(
     playerSource,

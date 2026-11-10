@@ -1055,9 +1055,18 @@ export interface DirectTrackStreams {
 export interface DirectMediaResolveOptions
   extends Omit<DirectRequestOptions, "method" | "query" | "body"> {
   consumerProductAvailable?: boolean;
+  /** Retry a decoder-incompatible AAC 160 stream using the alternate rendition. */
+  excludeHighQualityAac?: boolean;
 }
 
 function isHighQualityAac(value: RawTranscoding): boolean {
+  const preset = String(value.preset ?? "").trim().toLowerCase();
+  // Current SoundCloud values are `aac_160k` with quality `sq` and
+  // `aac_96k` with quality `lq`. The bitrate encoded in the preset is more
+  // precise than the broad quality tier, so it must be checked first.
+  if (/(?:^|[_-])160(?:k|kbps)?(?:$|[_-])/.test(preset)) return true;
+  if (/(?:^|[_-])96(?:k|kbps)?(?:$|[_-])/.test(preset)) return false;
+
   const quality = String(value.quality ?? "")
     .trim()
     .toLowerCase()
@@ -1073,7 +1082,6 @@ function isHighQualityAac(value: RawTranscoding): boolean {
     return false;
   }
 
-  const preset = String(value.preset ?? "").trim().toLowerCase();
   return (
     /(?:^|[_-])(?:hq|high|160)(?:k|kbps)?(?:$|[_-])/.test(preset) ||
     /^aac[_-]1(?:$|[_-])/.test(preset)
@@ -1083,18 +1091,34 @@ function isHighQualityAac(value: RawTranscoding): boolean {
 function transcodingRank(value: RawTranscoding): number {
   const format = isRecord(value.format) ? value.format : {};
   const protocol = String(format.protocol ?? "").toLowerCase();
-  const mime = String(format.mime_type ?? "").toLowerCase();
-  const preset = String(value.preset ?? "").toLowerCase();
   const isHls = protocol === "hls" || protocol === "hls-aes";
-  const isAac =
-    mime.includes("mp4") || mime.includes("aac") || preset.includes("aac");
-  const isMp3 = mime.includes("mpeg") || preset.includes("mp3");
-  if (protocol === "progressive" && isMp3) return 600;
-  if (protocol === "progressive") return 550;
-  if (isHls && isAac) return isHighQualityAac(value) ? 520 : 500;
-  if (isHls && isMp3) return 400;
-  if (isHls) return 100;
+  const codec = transcodingCodec(value);
+  if (protocol === "progressive" && codec === "mp3") return 600;
+  if (isHls && codec === "aac") return isHighQualityAac(value) ? 520 : 500;
+  if (isHls && codec === "mp3") return 400;
   return -1;
+}
+
+function transcodingCodec(value: RawTranscoding): "aac" | "mp3" | null {
+  const format = isRecord(value.format) ? value.format : {};
+  const mime = String(format.mime_type ?? "").trim().toLowerCase();
+  const mimeEssence = mime.split(";", 1)[0].trim();
+  const preset = String(value.preset ?? "").trim().toLowerCase();
+  if (
+    mimeEssence === "audio/mp4" ||
+    mimeEssence === "audio/aac" ||
+    mime.includes("mp4a") ||
+    /^aac(?:_|$)/.test(preset)
+  ) {
+    return "aac";
+  }
+  if (mimeEssence === "audio/mpeg" || /^mp3(?:_|$)/.test(preset)) {
+    return "mp3";
+  }
+  // `audio/mpegurl` describes an HLS manifest, not an MPEG audio codec.
+  // SoundCloud currently exposes an `abr_*` entry with this MIME value; it
+  // must not be mislabeled as legacy MP3 and fed to an incompatible MSE path.
+  return null;
 }
 
 function streamField(
@@ -1102,21 +1126,17 @@ function streamField(
 ): keyof DirectTrackStreams | null {
   const format = isRecord(value.format) ? value.format : {};
   const protocol = String(format.protocol ?? "").toLowerCase();
-  const mime = String(format.mime_type ?? "").toLowerCase();
+  const codec = transcodingCodec(value);
   const preset = String(value.preset ?? "").toLowerCase();
   if (protocol === "hls" || protocol === "hls-aes") {
-    if (
-      mime.includes("mp4") ||
-      mime.includes("aac") ||
-      preset.includes("aac")
-    ) {
+    if (codec === "aac") {
       return isHighQualityAac(value)
         ? "hls_aac_160_url"
         : "hls_aac_96_url";
     }
-    return "hls_mp3_128_url";
+    return codec === "mp3" ? "hls_mp3_128_url" : null;
   }
-  if (protocol === "progressive") {
+  if (protocol === "progressive" && codec === "mp3") {
     return value.snipped === true || preset.includes("preview")
       ? "preview_mp3_128_url"
       : "http_mp3_128_url";
@@ -1232,6 +1252,7 @@ async function resolveStreamsFromTrack(
   expectedTrackId: string,
   options: Omit<DirectRequestOptions, "method" | "query" | "body">,
   consumerProductAvailable?: boolean,
+  excludeHighQualityAac = false,
 ): Promise<DirectTrackStreams> {
   const policy =
     typeof rawTrack.policy === "string"
@@ -1313,7 +1334,8 @@ async function resolveStreamsFromTrack(
         rank: number;
         field: keyof DirectTrackStreams;
         fullness: number;
-      } => candidate.rank >= 0 && candidate.field !== null,
+      } => candidate.rank >= 0 && candidate.field !== null &&
+        !(excludeHighQualityAac && candidate.field === "hls_aac_160_url"),
     )
     .sort(
       (left, right) =>
@@ -1344,11 +1366,13 @@ async function resolveStreamsFromTrack(
         isRecord(payload) ? payload.url : undefined,
       ).toString();
       streams[field] = mediaUrl;
-      // A progressive MP3 is the reliable Spotify/CEF path. Once found, the
-      // lower-ranked HLS candidates are unnecessary.
-      if (field === "http_mp3_128_url") {
-        return streams;
-      }
+      // Candidates are already sorted in playback preference order. Return
+      // after the first valid URL so a lower-priority legacy transcoding can
+      // neither replace nor prevent a usable modern stream. SoundCloud
+      // removed progressive MP3 from its streaming API and now directs
+      // clients to prefer AAC HLS, retaining MP3 HLS only as a catalog
+      // migration fallback.
+      return streams;
     } catch (error) {
       if (
         error instanceof DirectSoundCloudError &&
@@ -1373,6 +1397,7 @@ export async function resolveDirectTrackStreams(
 ): Promise<{ track: unknown; streams: DirectTrackStreams }> {
   const {
     consumerProductAvailable,
+    excludeHighQualityAac,
     ...requestOptions
   } = options;
   const trackId = soundCloudNumericId(urn, "track");
@@ -1392,6 +1417,7 @@ export async function resolveDirectTrackStreams(
     trackId,
     requestOptions,
     consumerProductAvailable,
+    excludeHighQualityAac,
   );
   return { track, streams };
 }
@@ -1496,12 +1522,12 @@ export async function resolveDirectMediaSource(
     streams.http_mp3_128_url ??
     (access === "preview" ? streams.preview_mp3_128_url : undefined);
   const hls =
-    // Spotify's embedded Chromium build can reject AAC/fMP4 SourceBuffers
-    // (`bufferAddCodecError`) even when hls.js parsed the stream correctly.
-    // Prefer MPEG audio HLS when SoundCloud exposes it, then fall back to AAC.
-    streams.hls_mp3_128_url ??
+    // SoundCloud's current streaming contract is AAC HLS first and legacy
+    // MP3 HLS second. The selected codec travels with the URL so the player
+    // can use its bundled software AAC path when Spotify's CEF omits AAC MSE.
     streams.hls_aac_160_url ??
     streams.hls_aac_96_url ??
+    streams.hls_mp3_128_url ??
     undefined;
   const selected = progressive ?? hls;
   if (!selected) {
@@ -1523,6 +1549,12 @@ export async function resolveDirectMediaSource(
   }
   return {
     kind: progressive ? "progressive" : "hls",
+    codec: progressive
+      ? "mp3"
+      : streams.hls_aac_160_url === selected ||
+          streams.hls_aac_96_url === selected
+        ? "aac"
+        : "mp3",
     url: mediaUrl.toString(),
     expiresAt,
     access,

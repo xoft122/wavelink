@@ -521,7 +521,10 @@ export async function getRelatedTracks(
   return tagCursor(normalizeTrackCollection(payload), "track");
 }
 
-export async function createMediaSession(track: SCTrack): Promise<SCMediaSource> {
+export async function createMediaSession(
+  track: SCTrack,
+  options: { excludeHighQualityAac?: boolean } = {},
+): Promise<SCMediaSource> {
   const started = performance.now();
   try {
     const availability = classifyTrackAvailability(track);
@@ -535,6 +538,7 @@ export async function createMediaSession(track: SCTrack): Promise<SCMediaSource>
     }
     const source = await createDirectMediaSource(track, {
       consumerProductAvailable: getConsumerProductAvailability(),
+      excludeHighQualityAac: options.excludeHighQualityAac,
     });
     logDebug({
       ts: Date.now(),
@@ -542,7 +546,12 @@ export async function createMediaSession(track: SCTrack): Promise<SCMediaSource>
       endpoint: "/media/resolve",
       status: 200,
       durationMs: Math.round(performance.now() - started),
-      body: { kind: source.kind, access: source.access, expiresAt: source.expiresAt },
+      body: {
+        kind: source.kind,
+        codec: source.codec,
+        access: source.access,
+        expiresAt: source.expiresAt,
+      },
     });
     return source;
   } catch (cause) {

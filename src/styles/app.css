@@ -3708,6 +3708,41 @@ body.wl-header-interactive
   white-space: normal;
 }
 
+.wl-onboarding__network-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  vertical-align: middle;
+}
+
+.wl-onboarding__network-filter code {
+  min-width: 0;
+  user-select: text;
+}
+
+.wl-onboarding__network-filter button {
+  flex: none;
+  min-height: 24px;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 126, 77, 0.3);
+  border-radius: 5px;
+  background: transparent;
+  color: #ffd0b6;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.wl-onboarding__network-filter button:hover {
+  background: rgba(255, 90, 10, 0.14);
+}
+
+.wl-onboarding__network-filter button:focus-visible {
+  outline: 2px solid var(--wl-accent-bright);
+  outline-offset: 2px;
+}
+
 .wl-onboarding__error {
   margin-bottom: 16px;
   border: 1px solid rgba(241, 94, 108, 0.27);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import ts from "typescript";
 
 const [source, appCss] = await Promise.all([
   readFile(
@@ -31,6 +32,71 @@ test("authorization screen gives concise DevTools credential instructions", () =
     [...source.matchAll(/className="wl-onboarding__credential-step"/g)].length,
     4,
   );
+});
+
+test("the Network filter button copies the displayed hostname and handles clipboard failure", async () => {
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: {
+      jsx: ts.JsxEmit.React,
+      target: ts.ScriptTarget.ES2020,
+      module: ts.ModuleKind.CommonJS,
+      esModuleInterop: true,
+    },
+  }).outputText;
+  const load = new Function("require", "exports", "window", "navigator", compiled);
+  const createElement = (tag, props, ...children) => ({ tag, props, children });
+  const find = (node, predicate) => {
+    if (!node || typeof node !== "object") return undefined;
+    if (predicate(node)) return node;
+    for (const child of node.children) {
+      const found = find(child, predicate);
+      if (found) return found;
+    }
+  };
+
+  for (const mode of ["standard", "spotify", "unavailable"]) {
+    const writes = [];
+    const notifications = [];
+    const exports = {};
+    load(
+      (path) => path === "react" ? { createElement } : { WebSessionForm() {} },
+      exports,
+      {
+        Spicetify: {
+          Platform: {
+            ClipboardAPI: mode === "unavailable" ? undefined : {
+              copy: (text) => writes.push(["spotify", text]),
+            },
+          },
+          showNotification: (...args) => notifications.push(args),
+        },
+      },
+      {
+        clipboard: {
+          writeText: async (text) => {
+            if (mode !== "standard") throw new Error("Clipboard blocked");
+            writes.push(["standard", text]);
+          },
+        },
+      },
+    );
+    const view = exports.OAuthOnboarding({ isConnecting: false, error: null });
+    const filter = find(view, (node) => node.props?.className === "wl-onboarding__network-filter");
+    const [code, button] = filter.children;
+    assert.equal(code.children.join(""), "api-v2.soundcloud.com");
+    assert.equal(button.tag, "button");
+    assert.equal(button.props.type, "button");
+    await button.props.onClick();
+
+    if (mode === "unavailable") {
+      assert.deepEqual(writes, []);
+      assert.equal(notifications[0][1], true);
+      assert.match(notifications[0][0], /copy it manually/i);
+    } else {
+      assert.deepEqual(writes, [[mode, code.children.join("")]]);
+      assert.deepEqual(notifications, [["Network filter copied."]]);
+    }
+  }
 });
 
 test("legacy connection feature steps are no longer shown", () => {

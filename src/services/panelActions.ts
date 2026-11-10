@@ -63,7 +63,7 @@ export function classifyNativePanelAction(
   }
 
   if (
-    hasLabel(/^more options(?: for .+)?$/) ||
+    hasLabel(/^more(?: options(?: for .+)?)?$/) ||
     /^(?:more-button|context-menu-button|now-playing-view-more-button)$/.test(
       testId,
     )

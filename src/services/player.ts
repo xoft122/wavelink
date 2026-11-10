@@ -22,6 +22,12 @@ import {
   showSoundCloudFollowPrompt,
   showSoundCloudLikePrompt,
 } from "./followPrompt";
+import { isHlsSourceBufferCodecError } from "./hlsPlayback";
+import {
+  installSoftwareAacMediaFacade,
+  SoftwareAacDecodeError,
+  SoftwareAacPlayback,
+} from "./softwareAacPlayback";
 import {
   LikedTrackStatusDetail,
   canonicalLikedTrackId,
@@ -244,6 +250,14 @@ interface PanelSurfaceBinding {
   contextTarget: WaveLinkNavigationTarget;
 }
 
+interface BarSurfaceBinding {
+  root: HTMLElement;
+  likeButton: HTMLButtonElement;
+  likeSignature: string;
+  originalAriaLabel: string | null;
+  appliedAriaLabel: string;
+}
+
 interface OwnedCoverBinding {
   root: HTMLElement;
   host: HTMLElement;
@@ -422,6 +436,7 @@ const SEL_TITLE = [
   ".now-playing__name",
 ];
 const SEL_ARTIST = [
+  '[data-testid="now-playing-widget-v2-byline"]',
   ".main-trackInfo-artists:not([data-encore-id])", // outer layout container — correct ::before positioning
   '[data-encore-id="text"].main-trackInfo-artists', // fallback: inner Encore text node
   ".main-trackInfo-artists",
@@ -429,10 +444,16 @@ const SEL_ARTIST = [
   ".now-playing__artist",
 ];
 const SEL_BAR_WIDGET = [
+  '[data-testid="now-playing-widget-v2"]',
   '[data-testid="now-playing-widget"]',
   ".main-nowPlayingWidget-nowPlaying",
 ];
+const SEL_PLAYER_BAR = [
+  '[data-testid="now-playing-bar"]',
+  ".Root__now-playing-bar",
+];
 const SEL_PANEL_ROOT = [
+  "[data-wl-cinema-root]",
   "[data-npv-root]",
   ".NowPlayingView",
   ".main-nowPlayingView-nowPlayingWidget",
@@ -441,6 +462,12 @@ const SEL_PANEL_ROOT = [
   // windowed cinema mode and the real OS fullscreen variant.
   ".Root__cinema-view",
 ];
+const CINEMA_ROOT_SELECTOR = ".Root__cinema-view, [data-wl-cinema-root]";
+const SEL_PANEL_ARTIST_ABOUT = [
+  'div:has(> [data-testid="npv-artist-bio-button"])',
+  // Spotify's NPVArtistAboutV2 card; desktop builds can strip the test ID.
+  ".wYZcnNTqrjqNPCkIwTZt",
+].join(", ");
 const SEL_PANEL_META_ROOT = [
   ".main-nowPlayingView-trackInfo",
   ".main-nowPlayingView-contextItemInfo",
@@ -596,6 +623,9 @@ class SoundCloudPlayer {
   private audio: HTMLAudioElement;
   private linuxMediaSession: LinuxMediaSessionBridge;
   private hls: Hls | null = null;
+  private softwareAac: SoftwareAacPlayback | null = null;
+  private readonly _softwareAacFallbackTracks = new Set<string>();
+  private softwareAacContext: AudioContext | null = null;
   private _track: SCTrack | null = null;
   private _isLoading = false;
   private _error: string | null = null;
@@ -714,13 +744,16 @@ class SoundCloudPlayer {
         ".wl-sc-cover-host",
         ".main-nowPlayingWidget-coverArt",
         ".main-coverSlotCollapsed-container",
+        '[data-testid="cover-art-container"]',
+        '[data-testid="CoverSlotCollapsed__container"]',
+        '.wl-sc-panel-surface [data-testid="cover-art-slot"]',
         '.wl-sc-panel-surface [data-testid="track-visual-enhancement"]',
         ".wl-sc-panel-surface .main-nowPlayingView-coverArtVisualEnhancement",
         ".wl-sc-panel-surface .main-nowPlayingView-coverArt",
         ".wl-sc-panel-surface .main-nowPlayingView-coverArtContainer",
       ].join(", "),
     );
-    const cinemaSurface = !!element.closest(".Root__cinema-view");
+    const cinemaSurface = !!element.closest(CINEMA_ROOT_SELECTOR);
     const playerBarMetadataSurface = !!element.closest(
       ".wl-sc-meta-host.wl-sc-meta-bar",
     );
@@ -897,8 +930,10 @@ class SoundCloudPlayer {
     this.applyTrackInfo();
     if (this._track) this.activateLinuxMediaSession(this._track);
   };
+  private _barSurfaces = new Map<HTMLElement, BarSurfaceBinding>();
   private _panelSurfaces = new Map<HTMLElement, PanelSurfaceBinding>();
   private _cinemaArtistSurfaces = new Map<HTMLElement, CinemaArtistBinding>();
+  private _semanticCinemaRoots = new Set<HTMLElement>();
   private _hiddenNative = new Map<HTMLElement, HiddenNativeSnapshot>();
   private _blockedNative = new Map<HTMLElement, NativeInteractionBinding>();
   private _followStates = new Map<string, FollowState>();
@@ -960,7 +995,7 @@ class SoundCloudPlayer {
     if (!["ArrowLeft", "ArrowUp", "Home"].includes(event.key)) return;
     const target = event.currentTarget;
     if (!(target instanceof HTMLElement)) return;
-    const root = target.closest<HTMLElement>(".Root__cinema-view");
+    const root = target.closest<HTMLElement>(CINEMA_ROOT_SELECTOR);
     const artwork = root
       ? this._cinemaArtistSurfaces.get(root)?.artworkButton
       : null;
@@ -975,7 +1010,7 @@ class SoundCloudPlayer {
     if (!["ArrowRight", "ArrowDown", "End"].includes(event.key)) return;
     const target = event.currentTarget;
     if (!(target instanceof HTMLElement)) return;
-    const root = target.closest<HTMLElement>(".Root__cinema-view");
+    const root = target.closest<HTMLElement>(CINEMA_ROOT_SELECTOR);
     const artist = root
       ? this._cinemaArtistSurfaces.get(root)?.artistModeButton
       : null;
@@ -1192,15 +1227,26 @@ class SoundCloudPlayer {
       });
     };
 
-    const barWidget = q<HTMLElement>(SEL_BAR_WIDGET);
-    if (barWidget) {
-      const note = barWidget.querySelector<HTMLElement>(".cover-art-icon");
-      const nativeCover = barWidget.querySelector<HTMLImageElement>(
+    for (const barWidget of this.playerBarWidgets()) {
+      const note =
+        barWidget.querySelector<HTMLElement>(".cover-art-icon") ??
+        barWidget.querySelector<SVGElement>(
+          '[data-testid="cover-art-button"] svg',
+        )?.parentElement ?? null;
+      const nativeCover = qWithin<HTMLImageElement>(barWidget, [
+        '[data-testid="cover-art-container"] img:not([data-wl-owned])',
+        '[data-testid="CoverSlotCollapsed__container"] img:not([data-wl-owned])',
+        '[data-testid="cover-art-button"] img:not([data-wl-owned])',
         'img.cover-art-image:not([data-wl-owned])',
-      );
+      ]);
       const host =
         note?.closest<HTMLElement>(".cover-art") ??
         nativeCover?.closest<HTMLElement>(".cover-art") ??
+        qWithin<HTMLElement>(barWidget, [
+          '[data-testid="cover-art-button"]',
+          '[data-testid="cover-art-container"]',
+          '[data-testid="CoverSlotCollapsed__container"]',
+        ]) ??
         note?.parentElement ??
         qWithin<HTMLElement>(barWidget, [
           ".main-nowPlayingWidget-coverArt",
@@ -1211,12 +1257,13 @@ class SoundCloudPlayer {
     }
 
     for (const panelRoot of this.panelRoots()) {
-      if (panelRoot.closest(".Root__cinema-view")) continue;
+      if (panelRoot.closest(CINEMA_ROOT_SELECTOR)) continue;
       const note =
         panelRoot.querySelector<HTMLElement>(".cover-art-icon");
-      const nativeCover = panelRoot.querySelector<HTMLImageElement>(
+      const nativeCover = qWithin<HTMLImageElement>(panelRoot, [
+        '[data-testid="cover-art-slot"] img:not([data-wl-owned])',
         'img.cover-art-image:not([data-wl-owned])',
-      );
+      ]);
       // Keep this list aligned with collectCoverTargets(). A root-wide image
       // search can select Credits/About artwork instead of the semantic NPV
       // cover and would suppress recovery for the visible note placeholder.
@@ -1225,6 +1272,7 @@ class SoundCloudPlayer {
         nativeCover?.closest<HTMLElement>(".cover-art") ??
         note?.parentElement ??
         qWithin<HTMLElement>(panelRoot, [
+          '[data-testid="cover-art-slot"]',
           '[data-testid="track-visual-enhancement"]',
           ".main-nowPlayingView-coverArtVisualEnhancement",
           ".main-nowPlayingView-coverArt",
@@ -1396,7 +1444,7 @@ class SoundCloudPlayer {
       "Native Spotify Play intent captured — releasing WaveLink before click",
     );
     const releasedSpotifyUri = this.spotifyItemUri();
-    const releasedSpotifyCover = releasedSpotifyUri
+    const releasedSpotifyCover = releasedSpotifyUri && releasedSpotifyUri === this._spotifyBaselineUri
       ? this.captureSpotifyCoverRecovery(releasedSpotifyUri)
       : null;
     this.stop();
@@ -1567,8 +1615,9 @@ class SoundCloudPlayer {
   private mutationNodeContainsCinemaRoot(node: Node): boolean {
     if (!(node instanceof Element)) return false;
     return (
-      node.matches(".Root__cinema-view") ||
-      node.querySelector(".Root__cinema-view") !== null
+      node.matches(CINEMA_ROOT_SELECTOR) ||
+      node.querySelector(CINEMA_ROOT_SELECTOR) !== null ||
+      node.matches('[role="radiogroup"]')
     );
   }
 
@@ -1584,7 +1633,7 @@ class SoundCloudPlayer {
         this._sourceBadgeObservedCinemaRoots.has(record.target)
       ) {
         collapseStateChanged = true;
-        if (!record.target.classList.contains("Root__cinema-view")) {
+        if (!record.target.matches(CINEMA_ROOT_SELECTOR)) {
           rootsChanged = true;
         }
         continue;
@@ -1655,6 +1704,7 @@ class SoundCloudPlayer {
     this.audio.id = "wavelink-audio";
     this.audio.preload = "metadata";
     document.body.appendChild(this.audio);
+    installSoftwareAacMediaFacade(this.audio, () => this.softwareAac);
     this.linuxMediaSession = createLinuxMediaSessionBridge({
       play: () => this.play(),
       pause: () => this.pause(),
@@ -1693,6 +1743,16 @@ class SoundCloudPlayer {
       "pointermove",
       this._onSourceBadgeDocumentPointerMove,
       { passive: true },
+    );
+    document.addEventListener(
+      "pointerdown",
+      this._onSoftwareAacUnlockIntent,
+      true,
+    );
+    document.addEventListener(
+      "keydown",
+      this._onSoftwareAacUnlockIntent,
+      true,
     );
     this.startSourceBadgeCinemaObserver();
     window.addEventListener("blur", this._onSourceBadgeWindowBlur);
@@ -1931,7 +1991,10 @@ class SoundCloudPlayer {
     this.audio.addEventListener("ratechange", () => {
       this.linuxMediaSession.syncPosition(true);
     });
-    this.audio.addEventListener("volumechange", () => this.emit());
+    this.audio.addEventListener("volumechange", () => {
+      this.softwareAac?.syncGain();
+      this.emit();
+    });
     this.audio.addEventListener("error", () => {
       // Source replacement intentionally aborts the previous media load. Ignore
       // that transitional error; hls.js/startAudio own errors for the source
@@ -2152,7 +2215,12 @@ class SoundCloudPlayer {
         try {
           const recovery = this._spotifyCoverRecoveryCandidate;
           if (recovery) this.reconcileSpotifyCoverRecovery(recovery.uri);
-          if (!this._track) return;
+          if (!this._track) {
+            // React may commit the next native item after our handoff. Sweep
+            // any remaining bindings without restoring over its fresh props.
+            this.restoreNativeBar();
+            return;
+          }
           const currentUri = this.spotifyItemUri();
           if (!currentUri) {
             log("player", "songchange ignored: Spotify item is not ready");
@@ -3338,11 +3406,14 @@ class SoundCloudPlayer {
        * Never touches textContent → no React reconciliation conflict.
        */
       body.sc-active [data-testid="now-playing-widget"],
+      body.sc-active [data-testid="now-playing-widget-v2"],
       body.sc-active .main-nowPlayingWidget-nowPlaying {
         width: 100% !important;
         min-width: 0 !important;
       }
-      body.sc-active .main-nowPlayingWidget-trackInfo {
+      body.sc-active .main-nowPlayingWidget-trackInfo,
+      body.sc-active [data-testid="now-playing-widget"] > :has(.wl-sc-meta-title):has(.wl-sc-meta-artist),
+      body.sc-active [data-testid="now-playing-widget-v2"] > :has([data-testid="now-playing-widget-v2-byline"]) {
         flex: 1 1 0 !important;
         width: auto !important;
         min-width: 0 !important;
@@ -3378,7 +3449,13 @@ class SoundCloudPlayer {
       body.sc-active .wl-sc-meta-host.wl-sc-meta-panel {
         display: block !important;
         width: 100% !important;
+        margin: 0 !important;
         cursor: default !important;
+      }
+      body.sc-active .wl-sc-meta-bar {
+        display: block !important;
+        width: 100% !important;
+        margin: 0 !important;
       }
       body.sc-active .wl-sc-meta-host > :not(.wl-marquee-viewport) {
         opacity: 0 !important;
@@ -3447,6 +3524,30 @@ class SoundCloudPlayer {
       body.sc-active .wl-sc-cover-host {
         position: relative !important;
       }
+      /*
+       * React mounts fresh Spotify images before our DOM reconciliation. Mask
+       * them from their first paint, including the unmarked modern cinema
+       * root. Visibility preserves the geometry used by the artwork overlay.
+       * Never hide WaveLink covers or images inside owned Credits/queue cards.
+       */
+      body.sc-active :is(
+        [data-npv-root],
+        .NowPlayingView,
+        .main-nowPlayingView-nowPlayingWidget,
+        .Root__cinema-view,
+        [data-wl-cinema-root],
+        .Root__top-container > :has([role="radiogroup"] [role="radio"][value="artwork"]),
+        [data-testid="cover-art-button"],
+        [data-testid="cover-art-container"],
+        [data-testid="CoverSlotCollapsed__container"],
+        .main-nowPlayingWidget-coverArt,
+        .main-coverSlotCollapsed-container
+      ) :is(img, video):not(.wl-sc-cover):not([data-wl-owned]):not([data-wl-owned] *) {
+        visibility: hidden !important;
+      }
+      body.sc-active [role="radiogroup"]:has([role="radio"][value="artwork"]) [role="radio"]:is([value="lyrics"], [value="canvas"]) {
+        display: none !important;
+      }
       body.sc-active .wl-sc-cover-host > .wl-sc-cover-owned {
         position: absolute !important;
         inset: 0 !important;
@@ -3459,6 +3560,11 @@ class SoundCloudPlayer {
         object-fit: cover !important;
         border-radius: inherit !important;
         pointer-events: none !important;
+      }
+      body.sc-active .wl-sc-cover-host:has(video) > .wl-sc-cover-owned {
+        object-fit: contain !important;
+        background: var(--spice-main, #121212);
+        border-radius: var(--encore-corner-radius-larger-2, 8px) !important;
       }
       .wl-spotify-cover-recovery-host {
         position: relative !important;
@@ -3482,6 +3588,10 @@ class SoundCloudPlayer {
         pointer-events: none !important;
       }
       body.sc-active .wl-sc-native-hidden {
+        display: none !important;
+      }
+      /* Hide a newly mounted Spotify bio before the next reconciliation. */
+      body.sc-active :is(${SEL_PANEL_ROOT.join(", ")}) :is(${SEL_PANEL_ARTIST_ABOUT}):not([data-wl-owned], [data-wl-owned] *) {
         display: none !important;
       }
       /*
@@ -4099,6 +4209,9 @@ class SoundCloudPlayer {
         transform: translate(-50%, 0);
         pointer-events: auto;
       }
+      body.sc-active .Root__cinema-view.wl-sc-cinema-artist-mode .wl-cinema-artist-toolbar {
+        bottom: 24px;
+      }
       body.sc-active .Root__cinema-view .wl-cinema-artist-toolbar button {
         appearance: none;
         box-sizing: border-box;
@@ -4307,6 +4420,12 @@ class SoundCloudPlayer {
       }
       #sc-progress.sc-progress--hover .sc-progress__tip { opacity: 1; }
     `;
+    // Spicetify no longer supplies the semantic cinema class on every build.
+    // Keep the existing fullscreen rules shared with our discovered root.
+    s.textContent = s.textContent.replace(
+      /\.Root__cinema-view(?![-\w])/g,
+      ":is(.Root__cinema-view, [data-wl-cinema-root])",
+    );
     document.head.appendChild(s);
   }
 
@@ -4725,7 +4844,18 @@ class SoundCloudPlayer {
   }
 
   private panelRoots(): HTMLElement[] {
+    this.cinemaRoots();
     return qAllUnique<HTMLElement>(SEL_PANEL_ROOT);
+  }
+
+  private playerBarWidgets(): HTMLElement[] {
+    const bars = qAllUnique<HTMLElement>(SEL_PLAYER_BAR);
+    const widgets = qAllUnique<HTMLElement>(SEL_BAR_WIDGET);
+    // The sidebar/cinema may contain a second widget. Only the real bottom
+    // bar owns these bindings; older Spotify builds have no semantic bar root.
+    return bars.length > 0
+      ? widgets.filter((widget) => bars.some((bar) => bar.contains(widget)))
+      : widgets;
   }
 
   private hideNativeElement(
@@ -4763,9 +4893,35 @@ class SoundCloudPlayer {
   }
 
   private cinemaRoots(): HTMLElement[] {
-    return Array.from(
+    const roots = Array.from(
       document.querySelectorAll<HTMLElement>(".Root__cinema-view"),
     );
+    const detected = new Set<HTMLElement>();
+    for (const group of Array.from(document.querySelectorAll<HTMLElement>(
+      '[role="radiogroup"]',
+    ))) {
+      if (
+        group.closest("[data-wl-owned]") ||
+        !group.querySelector('[role="radio"][value="artwork"]') ||
+        !group.querySelector('[role="radio"][value="hero"]')
+      ) continue;
+      let root = group.parentElement;
+      while (root && root !== document.body && !root.classList.contains("Root__top-container")) {
+        const rect = root.getBoundingClientRect();
+        if (rect.width >= window.innerWidth * 0.65 && rect.height >= window.innerHeight * 0.5) {
+          detected.add(root);
+          root.setAttribute("data-wl-cinema-root", "true");
+          if (!roots.some((existing) => existing === root || existing.contains(root))) roots.push(root);
+          break;
+        }
+        root = root.parentElement;
+      }
+    }
+    for (const previous of this._semanticCinemaRoots) {
+      if (!detected.has(previous)) previous.removeAttribute("data-wl-cinema-root");
+    }
+    this._semanticCinemaRoots = detected;
+    return roots;
   }
 
   private cinemaControlTarget(
@@ -5902,7 +6058,7 @@ class SoundCloudPlayer {
     const current = new Set(
       Array.from(
         group.querySelectorAll<HTMLElement>(
-          '[role="radio"]:not([value="canvas"]):not([value="hero"]):not([data-wl-owned])',
+          '[role="radio"]:not([value="canvas"]):not([value="hero"]):not([value="lyrics"]):not([data-wl-owned])',
         ),
       ),
     );
@@ -6003,6 +6159,9 @@ class SoundCloudPlayer {
     const canvas = group.querySelector<HTMLElement>(
       '[role="radio"][value="canvas"]:not([data-wl-owned])',
     );
+    const lyrics = group.querySelector<HTMLElement>(
+      '[role="radio"][value="lyrics"]:not([data-wl-owned])',
+    );
     const nativeArtist = group.querySelector<HTMLElement>(
       '[role="radio"][value="hero"]:not([data-wl-owned])',
     );
@@ -6034,11 +6193,13 @@ class SoundCloudPlayer {
       this.syncCinemaArtistControlState(binding);
     }
 
-    if (canvas) {
-      this.hideNativeElement(
-        this.cinemaControlTarget(canvas, group),
-        activeHidden,
-      );
+    for (const unsupported of [canvas, lyrics]) {
+      if (unsupported) {
+        this.hideNativeElement(
+          this.cinemaControlTarget(unsupported, group),
+          activeHidden,
+        );
+      }
     }
 
     this.reconcileCinemaNativeModeButtons(binding, group);
@@ -6170,6 +6331,8 @@ class SoundCloudPlayer {
       ? WAVELINK_TRACK_FALLBACK_ARTWORK
       : preferredArtwork;
     const signature = [trackKey(track), artwork].join("\u0000");
+    const enteringArtwork = artworkMode &&
+      !binding.root.classList.contains("wl-sc-cinema-artwork-mode");
 
     binding.root.classList.toggle(
       "wl-sc-cinema-artwork-mode",
@@ -6180,6 +6343,7 @@ class SoundCloudPlayer {
     this.syncCinemaArtworkModeControl(binding);
     this.syncCinemaArtworkPalette(binding, artwork, signature);
     if (artworkMode) this.syncCinemaArtworkCoverGeometry(binding);
+    if (enteringArtwork) this.trackCinemaArtworkLayout(binding, 500);
     if (binding.artworkSignature === signature) return;
 
     binding.artworkSignature = signature;
@@ -6289,6 +6453,7 @@ class SoundCloudPlayer {
     }
     const surfaceRect = binding.artworkBackground.getBoundingClientRect();
     if (surfaceRect.width <= 0 || surfaceRect.height <= 0) return;
+    const atScrollTop = (binding.scrollViewport?.scrollTop ?? 0) <= 1;
     const validRect = (rect: DOMRect): boolean => {
       if (rect.width < 96 || rect.height < 96) return false;
       const ratio = rect.width / rect.height;
@@ -6298,7 +6463,16 @@ class SoundCloudPlayer {
         rect.right > surfaceRect.left &&
         rect.left < surfaceRect.right &&
         rect.bottom > surfaceRect.top &&
-        rect.top < surfaceRect.bottom
+        rect.top < surfaceRect.bottom &&
+        // Spotify can expose an entering cover below the visual viewport
+        // before its fullscreen layout settles. Keep our centered fallback
+        // instead of copying that transient position. Scrolling is allowed
+        // to move the cover above the viewport as usual.
+        (!atScrollTop || (
+          rect.top >= surfaceRect.top - 2 &&
+          rect.bottom <= surfaceRect.bottom + 2 &&
+          rect.top + rect.height / 2 <= surfaceRect.top + surfaceRect.height * 0.68
+        ))
       );
     };
 
@@ -6310,7 +6484,8 @@ class SoundCloudPlayer {
     if (
       cached?.isConnected &&
       binding.root.contains(cached) &&
-      cached.matches("img.wl-sc-cover:not([data-wl-owned])")
+      cached.matches("img:not([data-wl-owned])") &&
+      !cached.closest("[data-wl-owned]")
     ) {
       const rect = cached.getBoundingClientRect();
       if (validRect(rect)) nativeCover = { image: cached, rect };
@@ -6319,14 +6494,16 @@ class SoundCloudPlayer {
       nativeCover =
         Array.from(
           binding.root.querySelectorAll<HTMLImageElement>(
-            "img.wl-sc-cover:not([data-wl-owned])",
+            "img:not([data-wl-owned])",
           ),
         )
           .map((image) => ({
             image,
             rect: image.getBoundingClientRect(),
           }))
-          .filter(({ rect }) => validRect(rect))
+          .filter(({ image, rect }) =>
+            !image.closest("[data-wl-owned]") && validRect(rect),
+          )
           .sort(
             (left, right) =>
               right.rect.width * right.rect.height -
@@ -6798,9 +6975,11 @@ class SoundCloudPlayer {
     element.removeEventListener("contextmenu", binding.block, true);
     element.removeEventListener("keydown", binding.blockKey, true);
     element.classList.remove("wl-sc-native-blocked");
-    restoreAttribute(element, "href", binding.href);
-    restoreAttribute(element, "tabindex", binding.tabIndex);
-    restoreAttribute(element, "aria-disabled", binding.ariaDisabled);
+    // React can reuse this node for the next Spotify track before handoff.
+    // Only undo values we still own; never roll a fresh Spotify href back.
+    if (!element.hasAttribute("href")) restoreAttribute(element, "href", binding.href);
+    if (element.getAttribute("tabindex") === "-1") restoreAttribute(element, "tabindex", binding.tabIndex);
+    if (element.getAttribute("aria-disabled") === "true") restoreAttribute(element, "aria-disabled", binding.ariaDisabled);
     (element as HTMLElement & { inert: boolean }).inert = binding.inert;
     this._blockedNative.delete(element);
   }
@@ -6868,6 +7047,17 @@ class SoundCloudPlayer {
   }
 
   private findPanelHeader(root: HTMLElement): HTMLElement | null {
+    if (root.matches(CINEMA_ROOT_SELECTOR)) {
+      // The artwork layer is prepended to the cinema root. Do not rely on
+      // :first-child after takeover or the native context becomes visible again.
+      const controls = root.querySelector<HTMLElement>(
+        '[role="radiogroup"]:has([role="radio"][value="artwork"])',
+      );
+      const header = controls?.parentElement?.parentElement?.querySelector<HTMLElement>(
+        'a[href]:not([data-wl-owned])',
+      );
+      if (header) return header;
+    }
     const header = qWithin<HTMLElement>(root, [
       ":scope > :first-child a[href]",
       ".main-nowPlayingView-headerText a[href]",
@@ -7059,6 +7249,12 @@ class SoundCloudPlayer {
 
   private stalePanelSections(root: HTMLElement): HTMLElement[] {
     const sections = new Set<HTMLElement>();
+    // Lyrics and the artist bio can be div cards rather than semantic sections.
+    for (const section of Array.from(root.querySelectorAll<HTMLElement>(
+      `[data-testid="lyrics-npv-section"], ${SEL_PANEL_ARTIST_ABOUT}`,
+    ))) {
+      if (!section.closest("[data-wl-owned]")) sections.add(section);
+    }
     for (const heading of Array.from(
       root.querySelectorAll<HTMLElement>("h2, h3"),
     )) {
@@ -7448,6 +7644,74 @@ class SoundCloudPlayer {
     section.appendChild(row);
   }
 
+  private reconcileBarSurface(
+    root: HTMLElement,
+    track: SCTrack,
+    activeHidden: Set<HTMLElement>,
+  ): void {
+    // Both current widget variants end in a feedback/saved-track action group. Its
+    // buttons can lack labels and test IDs, so recognize the scoped structure
+    // instead of relying on translated "Add to library" labels.
+    const nativeChildren = Array.from(root.children).filter(
+      (child): child is HTMLElement =>
+        child instanceof HTMLElement && !child.hasAttribute("data-wl-owned"),
+    );
+    const actions = nativeChildren[nativeChildren.length - 1];
+    const isActionGroup = actions &&
+      !actions.matches('[data-testid="cover-art-container"], [data-testid="CoverSlotCollapsed__container"]') &&
+      !actions.querySelector('[data-testid="cover-art-button"], [data-testid="now-playing-widget-v2-byline"], .wl-sc-meta-host, a[href*="/artist/"]') &&
+      !!actions.querySelector('button, [role="button"]');
+    if (isActionGroup) this.hideNativeElement(actions, activeHidden);
+    // Also cover themes that wrap/reorder the native action group.
+    for (const action of Array.from(root.querySelectorAll<HTMLElement>(
+      'button, [role="button"]',
+    ))) {
+      if (!action.closest("[data-wl-owned]") && this.nativePanelActionKind(action)) {
+        this.hideNativeElement(action, activeHidden);
+      }
+    }
+
+    this.ensureOwnUser();
+    const like = this.ensureLikeState(track);
+    let binding = this._barSurfaces.get(root);
+    if (!binding) {
+      const likeButton = this.createPanelLikeButton();
+      likeButton.classList.add("wl-bar-like");
+      binding = {
+        root, likeButton, likeSignature: "",
+        originalAriaLabel: root.getAttribute("aria-label"),
+        appliedAriaLabel: "",
+      };
+      this._barSurfaces.set(root, binding);
+    }
+    if (binding.likeButton.parentElement !== root) {
+      root.appendChild(binding.likeButton);
+    }
+    binding.appliedAriaLabel = `Now playing: ${track.title} by ${track.user.username} on SoundCloud`;
+    root.setAttribute("aria-label", binding.appliedAriaLabel);
+    const signature = [trackKey(track), like.liked, like.busy].join("\u0000");
+    if (binding.likeSignature !== signature) {
+      binding.likeSignature = signature;
+      this.renderPanelLikeButton(binding.likeButton, like);
+    }
+  }
+
+  private releaseBarSurface(binding: BarSurfaceBinding): void {
+    binding.likeButton.remove();
+    if (binding.root.getAttribute("aria-label") === binding.appliedAriaLabel) {
+      restoreAttribute(binding.root, "aria-label", binding.originalAriaLabel);
+    }
+    this._barSurfaces.delete(binding.root);
+  }
+
+  private releaseUnusedBarSurfaces(active: Set<HTMLElement>): void {
+    for (const binding of Array.from(this._barSurfaces.values())) {
+      if (!active.has(binding.root) || !binding.root.isConnected) {
+        this.releaseBarSurface(binding);
+      }
+    }
+  }
+
   private reconcilePanelSurface(
     root: HTMLElement,
     track: SCTrack,
@@ -7646,14 +7910,25 @@ class SoundCloudPlayer {
       targets.push({ host, role, surface });
     };
 
-    const barWidget = q<HTMLElement>(SEL_BAR_WIDGET);
-    if (barWidget) {
+    const native = this.getNativeMetadata();
+    for (const barWidget of this.playerBarWidgets()) {
       const metaRoot =
         barWidget.querySelector<HTMLElement>(
           ".main-nowPlayingWidget-trackInfo",
         ) ?? barWidget;
-      push(qWithin(metaRoot, SEL_TITLE), "title", "bar");
-      push(qWithin(metaRoot, SEL_ARTIST), "artist", "bar");
+      // Keep the existing host after injecting our marquee: its textContent
+      // now contains both native and WaveLink text, so exact matching alone
+      // would lose the v2 title on the following timer tick.
+      const title =
+        metaRoot.querySelector<HTMLElement>(".wl-sc-meta-title") ??
+        qWithin<HTMLElement>(metaRoot, SEL_TITLE) ??
+        this.findExactMetadataHost(metaRoot, native.title);
+      const artist =
+        metaRoot.querySelector<HTMLElement>(".wl-sc-meta-artist") ??
+        qWithin<HTMLElement>(metaRoot, SEL_ARTIST) ??
+        this.findPanelArtistHost(metaRoot, native.title, native.artists);
+      push(title, "title", "bar");
+      push(artist, "artist", "bar");
     }
 
     for (const panelRoot of this.panelRoots()) {
@@ -7761,8 +8036,13 @@ class SoundCloudPlayer {
     binding.host.removeAttribute("data-wl-overflow");
     binding.host.removeAttribute("data-sc-title");
     binding.host.removeAttribute("data-sc-artist");
-    restoreAttribute(binding.host, "aria-label", binding.originalAriaLabel);
-    restoreAttribute(binding.host, "title", binding.originalTitle);
+    const appliedText = binding.content.textContent;
+    if (binding.host.getAttribute("aria-label") === appliedText) {
+      restoreAttribute(binding.host, "aria-label", binding.originalAriaLabel);
+    }
+    if (binding.host.getAttribute("title") === appliedText) {
+      restoreAttribute(binding.host, "title", binding.originalTitle);
+    }
     this._metadataBindings.delete(binding.host);
   }
 
@@ -7901,6 +8181,34 @@ class SoundCloudPlayer {
     }
   }
 
+  private findPanelVideoCoverHost(root: HTMLElement): HTMLElement | null {
+    const rootRect = root.getBoundingClientRect();
+    if (rootRect.width <= 0) return null;
+    const video = Array.from(root.querySelectorAll<HTMLVideoElement>("video"))
+      .find((candidate) => {
+        if (candidate.closest("[data-wl-owned]")) return false;
+        const rect = candidate.getBoundingClientRect();
+        return rect.width >= Math.max(96, rootRect.width * 0.6) &&
+          rect.height >= 96 && rect.top <= rootRect.top + 160;
+      });
+    if (!video) return null;
+
+    // Canvas expands its absolutely-positioned 9:16 video outside a normal
+    // square artwork slot. Mount into that slot, not the overflowing video
+    // wrapper, so SoundCloud artwork keeps its usual size and position.
+    let parent = video.parentElement;
+    while (parent && parent !== root) {
+      const rect = parent.getBoundingClientRect();
+      if (rect.width >= 96 && rect.height >= 96 &&
+        rect.width <= rootRect.width + 2 &&
+        rect.width / rect.height >= 0.8 && rect.width / rect.height <= 1.25) {
+        return parent;
+      }
+      parent = parent.parentElement;
+    }
+    return video.parentElement;
+  }
+
   private collectCoverTargets(preferOwnedCover = false): HTMLImageElement[] {
     const covers = new Set<HTMLImageElement>();
     const activeOwnedRoots = new Set<HTMLElement>();
@@ -7908,12 +8216,13 @@ class SoundCloudPlayer {
       root: HTMLElement,
       cover: HTMLImageElement | null,
       host: HTMLElement | null,
+      keepNativeImage = false,
     ): void => {
       // A local fallback must never replace Spotify's React-owned image. When
       // the same paused Spotify item is replayed, React keeps the old props and
       // may not repair an image/srcset that WaveLink changed in the DOM. Keep
       // that native cover untouched underneath a disposable WaveLink overlay.
-      if (preferOwnedCover && host) {
+      if ((preferOwnedCover || keepNativeImage) && host) {
         activeOwnedRoots.add(root);
         covers.add(this.ensureOwnedCover(root, host));
         return;
@@ -7928,9 +8237,11 @@ class SoundCloudPlayer {
       covers.add(this.ensureOwnedCover(root, host));
     };
 
-    const barWidget = q<HTMLElement>(SEL_BAR_WIDGET);
-    if (barWidget) {
+    for (const barWidget of this.playerBarWidgets()) {
       const cover = qWithin<HTMLImageElement>(barWidget, [
+        '[data-testid="cover-art-container"] img:not([data-wl-owned])',
+        '[data-testid="CoverSlotCollapsed__container"] img:not([data-wl-owned])',
+        '[data-testid="cover-art-button"] img:not([data-wl-owned])',
         ".main-nowPlayingWidget-coverArt img.cover-art-image",
         ".main-coverSlotCollapsed-container img:not([data-wl-owned])",
         '[data-testid="cover-art-image"]',
@@ -7939,14 +8250,28 @@ class SoundCloudPlayer {
       const iconHost = barWidget.querySelector<HTMLElement>(".cover-art-icon")
         ?.parentElement;
       const host = qWithin<HTMLElement>(barWidget, [
+        '[data-testid="cover-art-button"]',
+        '[data-testid="cover-art-container"]',
+        '[data-testid="CoverSlotCollapsed__container"]',
         ".main-nowPlayingWidget-coverArt",
         ".main-coverSlotCollapsed-container",
       ]) ?? iconHost ?? cover?.parentElement ?? null;
-      useTarget(barWidget, cover, host);
+      // Spotify's current Image component remembers load errors in React
+      // state. Changing its src can leave a permanent note after handoff, even
+      // after restoring the original attributes. Keep that image untouched.
+      useTarget(barWidget, cover, host, !!barWidget.querySelector(
+        '[data-testid="cover-art-button"]',
+      ));
     }
 
     for (const panelRoot of this.panelRoots()) {
-      const cover = qWithin<HTMLImageElement>(panelRoot, [
+      const cinema = panelRoot.matches(CINEMA_ROOT_SELECTOR);
+      // Fullscreen already owns a sharp cover above its background. Do not
+      // inject a second image into Spotify's animated cover container: its
+      // layout must remain untouched and is only a geometry reference.
+      if (cinema) continue;
+      let cover = qWithin<HTMLImageElement>(panelRoot, [
+        '[data-testid="cover-art-slot"] img:not([data-wl-owned])',
         '[data-testid="track-visual-enhancement"] img:not([data-wl-owned])',
         ".main-nowPlayingView-coverArtVisualEnhancement img.cover-art-image",
         ".main-nowPlayingView-coverArt img.cover-art-image",
@@ -7957,11 +8282,19 @@ class SoundCloudPlayer {
       const iconHost = panelRoot.querySelector<HTMLElement>(".cover-art-icon")
         ?.parentElement;
       const structuralHost = qWithin<HTMLElement>(panelRoot, [
+        '[data-testid="cover-art-slot"]',
         '[data-testid="track-visual-enhancement"]',
         ".main-nowPlayingView-coverArtVisualEnhancement",
         ".main-nowPlayingView-coverArt",
         ".main-nowPlayingView-coverArtContainer",
       ]) ?? iconHost ?? null;
+      const videoHost = !structuralHost
+        ? this.findPanelVideoCoverHost(panelRoot)
+        : null;
+      if (videoHost) {
+        useTarget(panelRoot, null, videoHost, true);
+        continue;
+      }
 
       // Spotify's missing-art placeholder has no <img>. Prefer its semantic
       // cover host over every other image in the NPV, then mount a WaveLink
@@ -7973,7 +8306,9 @@ class SoundCloudPlayer {
         continue;
       }
       const host = structuralHost ?? cover?.parentElement ?? null;
-      useTarget(panelRoot, cover, host);
+      useTarget(panelRoot, cover, host, !!panelRoot.querySelector(
+        '[data-testid="cover-art-slot"]',
+      ));
     }
     this.releaseUnusedOwnedCovers(activeOwnedRoots);
     return Array.from(covers);
@@ -8004,10 +8339,18 @@ class SoundCloudPlayer {
 
   private applyTrackInfo(): void {
     const track = this._track;
-    if (!track) return;
+    // Profile/like requests can finish after media loading failed and released
+    // Spotify. Never reinsert overlays while their sc-active styles are off.
+    if (!track || !document.body.classList.contains("sc-active")) return;
     try {
-      const panelRoots = new Set(this.panelRoots());
       const activeHidden = new Set<HTMLElement>();
+      const barRoots = new Set(this.playerBarWidgets());
+      for (const root of barRoots) {
+        this.reconcileBarSurface(root, track, activeHidden);
+      }
+      this.releaseUnusedBarSurfaces(barRoots);
+
+      const panelRoots = new Set(this.panelRoots());
       for (const root of panelRoots) {
         this.reconcilePanelSurface(root, track, activeHidden);
       }
@@ -8066,7 +8409,10 @@ class SoundCloudPlayer {
         image.classList.add("wl-sc-cover");
         if (Array.from(panelRoots).some((root) => root.contains(image))) {
           image.classList.add("wl-sc-cover-panel");
-          this.blockNativeInteraction(image, activeInteractions);
+          this.blockNativeInteraction(
+            image.closest<HTMLElement>(".wl-sc-cover-host") ?? image,
+            activeInteractions,
+          );
         }
         image.removeEventListener("error", this._onCoverImageError);
         image.addEventListener("error", this._onCoverImageError);
@@ -8090,9 +8436,70 @@ class SoundCloudPlayer {
       this.hls.destroy();
       this.hls = null;
     }
+    if (this.softwareAac) {
+      const softwareAac = this.softwareAac;
+      softwareAac.destroy();
+      this.softwareAac = null;
+    }
     this.audio.pause();
     this.audio.removeAttribute("src");
     this.audio.load();
+  }
+
+  private ensureSoftwareAacContext(): AudioContext {
+    if (
+      this.softwareAacContext &&
+      this.softwareAacContext.state !== "closed"
+    ) {
+      return this.softwareAacContext;
+    }
+    const AudioContextConstructor =
+      window.AudioContext ??
+      (window as typeof window & {
+        webkitAudioContext?: typeof AudioContext;
+      }).webkitAudioContext;
+    if (!AudioContextConstructor) {
+      throw new Error("This Spotify build has no Web Audio output.");
+    }
+    this.softwareAacContext = new AudioContextConstructor({
+      latencyHint: "playback",
+    });
+    return this.softwareAacContext;
+  }
+
+  private readonly _onSoftwareAacUnlockIntent = (event: Event): void => {
+    if (!event.isTrusted) return;
+    if (
+      event instanceof KeyboardEvent &&
+      event.key !== "Enter" &&
+      event.key !== " "
+    ) {
+      return;
+    }
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target?.closest(".wl-app")) return;
+    this.primeSoftwareAacOutput(true);
+  };
+
+  private primeSoftwareAacOutput(fromTrustedInput = false): void {
+    // Creating/resuming during the synchronous part of a track click preserves
+    // Chrome's autoplay grant. Automatic queue advances then reuse this one
+    // context instead of requiring a new user gesture for every track.
+    if (
+      !fromTrustedInput &&
+      navigator.userActivation &&
+      !navigator.userActivation.isActive
+    ) {
+      return;
+    }
+    try {
+      const context = this.ensureSoftwareAacContext();
+      if (context.state !== "running") {
+        void context.resume().catch(() => undefined);
+      }
+    } catch (cause) {
+      warn("player", "Could not prime the bundled AAC audio output:", cause);
+    }
   }
 
   private restoreSpotifyVolumeProfile(): void {
@@ -8128,6 +8535,9 @@ class SoundCloudPlayer {
     for (const root of Array.from(this._ownedCoverBindings.keys())) {
       this.releaseOwnedCover(root);
     }
+    for (const binding of Array.from(this._barSurfaces.values())) {
+      this.releaseBarSurface(binding);
+    }
     for (const binding of Array.from(this._panelSurfaces.values())) {
       this.releasePanelSurface(binding);
     }
@@ -8159,8 +8569,12 @@ class SoundCloudPlayer {
     this.emit();
   }
 
-  private async attachMedia(track: SCTrack, loadId: number): Promise<boolean> {
-    const source = await createMediaSession(track);
+  private async attachMedia(
+    track: SCTrack,
+    loadId: number,
+    excludeHighQualityAac = this._softwareAacFallbackTracks.has(trackKey(track)),
+  ): Promise<boolean> {
+    const source = await createMediaSession(track, { excludeHighQualityAac });
     if (loadId !== this._loadId) return false;
     this.resetMediaSource();
 
@@ -8171,6 +8585,48 @@ class SoundCloudPlayer {
       this.audio.removeAttribute("crossorigin");
       this.audio.src = source.url;
       this.audio.load();
+      return true;
+    }
+
+    const nativeAacMseSupported =
+      typeof MediaSource !== "undefined" &&
+      typeof MediaSource.isTypeSupported === "function" &&
+      MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
+    if (source.codec === "aac" && !nativeAacMseSupported) {
+      let softwareAac: SoftwareAacPlayback;
+      try {
+        softwareAac = await SoftwareAacPlayback.create({
+          mediaElement: this.audio,
+          audioContext: this.ensureSoftwareAacContext(),
+          sourceUrl: source.url,
+          durationHint: track.duration / 1_000,
+          onFatalError: (message) => {
+            if (
+              loadId === this._loadId &&
+              this.softwareAac === softwareAac
+            ) {
+              this.failPlayback(`AAC decoder: ${message}`);
+            }
+          },
+        });
+      } catch (cause) {
+        if (loadId !== this._loadId) return false;
+        if (!excludeHighQualityAac && cause instanceof SoftwareAacDecodeError) {
+          // Some valid SoundCloud AAC 160 renditions use bitstream elements
+          // the bundled decoder cannot consume. Retry once without that
+          // rendition; remember the choice only for this track/session.
+          this._softwareAacFallbackTracks.add(trackKey(track));
+          warn("player", "Retrying '%s' with alternate AAC after a decoder failure", track.title);
+          return this.attachMedia(track, loadId, true);
+        }
+        throw cause;
+      }
+      if (loadId !== this._loadId) {
+        softwareAac.destroy();
+        return false;
+      }
+      this.softwareAac = softwareAac;
+      softwareAac.notifyReady();
       return true;
     }
 
@@ -8185,6 +8641,10 @@ class SoundCloudPlayer {
           // audio-only, so the small main-thread cost is preferable to a hard
           // worker startup failure.
           enableWorker: false,
+          // hls.js 1.6 prefers the newer ManagedMediaSource API when a host
+          // exposes it. Spotify's embedded Chromium is more reliable with the
+          // regular MediaSource implementation used by Hls.isSupported().
+          preferManagedMediaSource: false,
           backBufferLength: 90,
           maxBufferLength: 45,
           manifestLoadingTimeOut: 15_000,
@@ -8205,11 +8665,25 @@ class SoundCloudPlayer {
           settled = true;
           hls.destroy();
           if (this.hls === hls) this.hls = null;
-          reject(new Error("Timed out while loading the HLS manifest."));
-        }, 20_000);
+          reject(new Error("Timed out while preparing the HLS audio buffer."));
+        }, 30_000);
 
+        // resetMediaSource() destroys the previous HLS instance whenever the
+        // user switches or stops a track. Settle that superseded attachment
+        // immediately instead of leaving its Promise alive until the timeout.
+        hls.on(Hls.Events.DESTROYING, () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timeout);
+          if (this.hls === hls) this.hls = null;
+          resolve(false);
+        });
         hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(source.url));
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        // A parsed manifest only proves that the playlist is readable. Wait
+        // until hls.js has successfully created the SourceBuffer so a later
+        // bufferAddCodecError cannot turn an already-resolved setup into an
+        // immediate playback failure.
+        hls.on(Hls.Events.BUFFER_CREATED, () => {
           if (settled) return;
           settled = true;
           window.clearTimeout(timeout);
@@ -8222,7 +8696,6 @@ class SoundCloudPlayer {
           resolve(true);
         });
         hls.on(Hls.Events.ERROR, (_event, data) => {
-          if (!data.fatal) return;
           if (loadId !== this._loadId || this.hls !== hls) {
             if (!settled) {
               settled = true;
@@ -8232,6 +8705,28 @@ class SoundCloudPlayer {
             hls.destroy();
             return;
           }
+          // hls.js initially emits bufferAddCodecError as non-fatal and may
+          // promote it later when no alternate level exists. Handle it before
+          // the fatal guard and never call recoverMediaError(): re-attaching
+          // cannot make an unsupported SourceBuffer MIME type usable.
+          if (isHlsSourceBufferCodecError(data.details)) {
+            const mimeType =
+              "mimeType" in data && typeof data.mimeType === "string"
+                ? ` (${data.mimeType})`
+                : "";
+            const message = `Unsupported HLS audio buffer${mimeType}: ${data.details}`;
+            if (!settled) {
+              settled = true;
+              window.clearTimeout(timeout);
+              hls.destroy();
+              if (this.hls === hls) this.hls = null;
+              reject(new Error(message));
+              return;
+            }
+            this.failPlayback(message);
+            return;
+          }
+          if (!data.fatal) return;
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRecoveries < 1) {
             networkRecoveries += 1;
             hls.startLoad();
@@ -9307,6 +9802,7 @@ class SoundCloudPlayer {
     autoPlay = true,
     skipUnavailable = false,
   ): Promise<TrackLoadResult> {
+    if (autoPlay) this.primeSoftwareAacOutput();
     this.cancelSpotifyCoverRecovery();
     const loadId = ++this._loadId;
     this._playRequestedWhileLoading = false;
@@ -9319,6 +9815,10 @@ class SoundCloudPlayer {
       }
     }
     const previousTrack = this._track;
+    // Tear down the old source while _track/currentEntry still describe it.
+    // Its synchronous pause event must never save the old position under the
+    // metadata of the track we are about to load.
+    this.resetMediaSource();
     if (!this._track) this._spotifyBaselineUri = this.spotifyItemUri();
     this.ensureTrackQueued(track);
     log(
@@ -9333,10 +9833,8 @@ class SoundCloudPlayer {
     this._isLoading = true;
     this._error = null;
     this._notice = null;
-    // Stop the previous source immediately. The new source is attached only
-    // if this loadId is still current, so an older network response cannot
-    // tear down a newer track's HLS instance.
-    this.resetMediaSource();
+    // The old source was stopped before replacing _track above. The new source
+    // is attached only if this loadId is still current.
     this.startTimer(); // keep Spotify muted during stream-URL resolution
     this.emit();
 
@@ -9888,6 +10386,10 @@ class SoundCloudPlayer {
   }
 
   stop(): void {
+    const releasedSpotifyUri = this.spotifyItemUri();
+    const releasedSpotifyCover = releasedSpotifyUri && releasedSpotifyUri === this._spotifyBaselineUri
+      ? this.captureSpotifyCoverRecovery(releasedSpotifyUri)
+      : null;
     this.cancelSpotifyCoverRecovery();
     this._loadId++;
     if (this._spotifySongChangeTimer !== null) {
@@ -9915,6 +10417,13 @@ class SoundCloudPlayer {
     this.releaseSpotifyControl();
     this.updateSourceBadge(null);
     this.emit();
+    if (
+      !this._track && releasedSpotifyUri &&
+      this.spotifyItemUri() === releasedSpotifyUri
+    ) {
+      this._spotifyCoverRecoveryCandidate = releasedSpotifyCover;
+      this.scheduleSpotifyCoverRecovery(releasedSpotifyUri);
+    }
   }
 
   seek(ratio: number): void {
@@ -10056,6 +10565,16 @@ class SoundCloudPlayer {
       true,
     );
     document.removeEventListener(
+      "pointerdown",
+      this._onSoftwareAacUnlockIntent,
+      true,
+    );
+    document.removeEventListener(
+      "keydown",
+      this._onSoftwareAacUnlockIntent,
+      true,
+    );
+    document.removeEventListener(
       "click",
       this._onStaleSpotifyMetadataInteraction,
       true,
@@ -10108,6 +10627,11 @@ class SoundCloudPlayer {
     // Restore Spotify's volume profile visually
     this.restoreSpotifyVolumeProfile();
     this.resetMediaSource();
+    const softwareAacContext = this.softwareAacContext;
+    this.softwareAacContext = null;
+    if (softwareAacContext && softwareAacContext.state !== "closed") {
+      void softwareAacContext.close().catch(() => undefined);
+    }
     this.audio.remove();
     this.muteSpotifyAudio(false);
     this._sourceBadge?.remove();

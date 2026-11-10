@@ -70,6 +70,7 @@ declare namespace Spicetify {
   const Platform: {
     RequestBuilder?: NativeRequestBuilder;
     LocalStorageAPI?: PlatformLocalStorageAPI;
+    ClipboardAPI?: { copy(text: string): void | Promise<void> };
     [key: string]: unknown;
   };
 

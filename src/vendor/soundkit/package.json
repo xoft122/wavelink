@@ -1,0 +1,5 @@
+{
+  "name": "@wavelink/vendor-soundkit-wasm",
+  "private": true,
+  "type": "module"
+}

@@ -118,6 +118,7 @@ export type SCSearchResult = SCCollection<SCTrack>;
 
 export interface SCMediaSource {
   kind: "hls" | "progressive";
+  codec: "aac" | "mp3";
   url: string;
   expiresAt: number;
   access: "playable" | "preview";

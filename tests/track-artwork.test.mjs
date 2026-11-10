@@ -92,7 +92,7 @@ test("native player cover recovery owns Spotify note placeholders safely", async
   );
   assert.match(
     collectCoverTargets,
-    /preferOwnedCover && host[\s\S]{0,180}this\.ensureOwnedCover\(root, host\)/,
+    /\(preferOwnedCover \|\| keepNativeImage\) && host[\s\S]{0,180}this\.ensureOwnedCover\(root, host\)/,
   );
   assert.doesNotMatch(applyTrackInfo, /track\.user\.avatar_url/);
   assert.doesNotMatch(applyTrackInfo, /if \(art\)/);
