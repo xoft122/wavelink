@@ -1,4 +1,4 @@
-/* ../../../../../../AppData/Local/Temp/tmp-8720-SPk0EO30lzsu/19ff05358e80/app.css */
+/* ../../../../../../AppData/Local/Temp/tmp-11636-usGUhe3T8J5t/1a1c4dd581d0/app.css */
 .sc-hidden {
   display: none !important;
 }
@@ -3180,6 +3180,38 @@ body.wl-header-interactive .wl-topbar :is(button, a, input, select, textarea, [r
   font-size: 0.92em;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+.wl-onboarding__network-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  vertical-align: middle;
+}
+.wl-onboarding__network-filter code {
+  min-width: 0;
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  user-select: text;
+}
+.wl-onboarding__network-filter button {
+  flex: none;
+  min-height: 24px;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 126, 77, 0.3);
+  border-radius: 5px;
+  background: transparent;
+  color: #ffd0b6;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.wl-onboarding__network-filter button:hover {
+  background: rgba(255, 90, 10, 0.14);
+}
+.wl-onboarding__network-filter button:focus-visible {
+  outline: 2px solid var(--wl-accent-bright);
+  outline-offset: 2px;
 }
 .wl-onboarding__error {
   margin-bottom: 16px;
