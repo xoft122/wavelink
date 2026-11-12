@@ -8635,10 +8635,7 @@ class SoundCloudPlayer {
       typeof MediaSource !== "undefined" &&
       typeof MediaSource.isTypeSupported === "function" &&
       MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
-    const source = await createMediaSession(track, {
-      preferStandardAac: !nativeAacMseSupported,
-      excludeAacRendition,
-    });
+    const source = await createMediaSession(track, { excludeAacRendition });
     if (loadId !== this._loadId) return false;
     this.resetMediaSource();
 
@@ -8668,8 +8665,7 @@ class SoundCloudPlayer {
       } catch (cause) {
         if (loadId !== this._loadId) return false;
         if (excludeAacRendition === undefined && cause instanceof SoftwareAacDecodeError) {
-          // Retry only a distinct rendition, including when the preferred
-          // software-compatible source is missing or itself undecodable.
+          // Retry only a distinct rendition if the selected one fails to decode.
           this._softwareAacFallbackTracks.set(trackKey(track), source.aacRendition);
           warn("player", "Retrying '%s' with alternate AAC after a decoder failure", track.title);
           return this.attachMedia(track, loadId, source.aacRendition);

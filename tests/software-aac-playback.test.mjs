@@ -5,6 +5,7 @@ import test from "node:test";
 import { gunzipSync } from "node:zlib";
 
 import ts from "typescript";
+import { patchSoundKitAacFill } from "../scripts/patch-soundkit-aac-fill.mjs";
 
 const [
   softwareSource,
@@ -380,7 +381,7 @@ function playerAttachHarness(create) {
   const Harness = new Function("createMediaSession", "MediaSource", "SoftwareAacPlayback", "SoftwareAacDecodeError", "trackKey", "warn", "log", "resumePositionSeconds", code)(
     async (track, options) => {
       requests.push({ track: track.id, ...options });
-      const order = options.preferStandardAac ? [96, 160] : [160, 96];
+      const order = [160, 96];
       const aacRendition = order.find((rendition) => rendition !== options.excludeAacRendition);
       return { kind: "hls", codec: "aac", url: `aac${aacRendition}`, aacRendition };
     },
@@ -410,30 +411,29 @@ function playerAttachHarness(create) {
   return { harness, requests };
 }
 
-test("software playback starts directly with the compatible AAC rendition", async () => {
+test("software playback starts directly at 160 kbps with the fixed decoder", async () => {
   const opened = [];
   const { harness, requests } = playerAttachHarness(async options => {
     opened.push(options.rendition);
     return { rendition: options.rendition, notifyReady() {}, destroy() {} };
   });
   assert.equal(await harness.attachMedia({ id: "stromae-instrumental" }, 1), true);
-  assert.deepEqual(opened, [96], "the software decoder must never start this track on AAC160 first");
-  assert.equal(requests[0].preferStandardAac, true);
+  assert.deepEqual(opened, [160]);
   assert.equal(requests[0].excludeAacRendition, undefined);
 });
 
 test("AAC decode fallback retries a distinct rendition and remembers only the affected track", async () => {
   let ready = 0;
   const { harness, requests } = playerAttachHarness(async options => {
-    if (options.rendition === 96) throw new software.SoftwareAacDecodeError("invalid fill element length");
+    if (options.rendition === 160) throw new software.SoftwareAacDecodeError("incompatible AAC feature");
     return { notifyReady() { ready++; }, destroy() {} };
   });
-  const track = { id: "incompatible-standard", title: "AAC fallback fixture", duration: 176060 };
+  const track = { id: "incompatible-aac", title: "AAC fallback fixture", duration: 176060 };
   assert.equal(await harness.attachMedia(track, 1), true);
-  assert.deepEqual(requests.map(r => r.excludeAacRendition), [undefined, 96]);
+  assert.deepEqual(requests.map(r => r.excludeAacRendition), [undefined, 160]);
   assert.equal(ready, 1);
   await harness.attachMedia(track, 1);
-  assert.equal(requests.at(-1).excludeAacRendition, 96, "replaying the affected track must start on the known working rendition");
+  assert.equal(requests.at(-1).excludeAacRendition, 160, "replaying the affected track must start on the known working rendition");
   assert.equal(harness._softwareAacFallbackTracks.has("other-track"), false);
 });
 
@@ -479,7 +479,7 @@ test("late AAC failure swaps media once, resumes at the same time and keeps the 
   const { harness, requests } = playerAttachHarness(async (options) => {
     opened.push(options);
     return {
-      paused: options.rendition === 160,
+      paused: options.rendition === 96,
       rendition: options.rendition,
       destroy() {},
       notifyReady() {
@@ -504,7 +504,7 @@ test("late AAC failure swaps media once, resumes at the same time and keeps the 
   opened[0].onFatalError(error);
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.deepEqual(requests.map(r => r.excludeAacRendition), [undefined, 96]);
+  assert.deepEqual(requests.map(r => r.excludeAacRendition), [undefined, 160]);
   assert.deepEqual(resumes, [[1, 227.285]]);
   assert.deepEqual(failures, []);
   assert.equal(harness._isLoading, false);
@@ -525,7 +525,7 @@ test("AAC recovery honors pause and does not take over a newer track", async () 
     let starts = 0;
     let alternativeDestroyed = false;
     const { harness } = playerAttachHarness(async (options) => {
-      if (options.rendition === 96) {
+      if (options.rendition === 160) {
         fatal = options.onFatalError;
         return { rendition: options.rendition, paused: change === "paused", notifyReady() {}, destroy() {} };
       }
@@ -579,7 +579,7 @@ test("bundled WASM decoder is embedded without an XPUI asset fetch", async () =>
   assert.ok(base64, "generated embedded SoundKit payload is missing");
   const embedded = gunzipSync(Buffer.from(base64, "base64"));
   assert.equal(size, wasm.byteLength);
-  assert.deepEqual(embedded, wasm);
+  assert.deepEqual(embedded, patchSoundKitAacFill(wasm));
   assert.equal(createHash("sha256").update(embedded).digest("hex"), sha256);
 
   assert.match(softwareSource, /new DecompressionStream\("gzip"\)/);
@@ -602,6 +602,40 @@ test("bundled WASM decoder is embedded without an XPUI asset fetch", async () =>
   );
   assert.equal(scripts.postbuild, undefined);
   assert.equal(scripts["postbuild:install"], undefined);
+});
+
+test("embedded SoundKit accepts the 14-byte escaped AAC fill and preserves other lengths", async () => {
+  const url = new URL("../src/vendor/soundkit/soundkit_wasm.js", import.meta.url);
+  const original = await import(`${url.href}?original-aac`);
+  const patched = await import(`${url.href}?patched-aac`);
+  const sourceWasm = await readFile(new URL("../src/vendor/soundkit/soundkit_wasm_bg.wasm", import.meta.url));
+  const base64 = payloadSource.match(/SOUNDKIT_WASM_GZIP_BASE64\s*=\s*"([A-Za-z0-9+/=]+)"/)?.[1];
+  await original.default({ module_or_path: sourceWasm });
+  await patched.default({ module_or_path: gunzipSync(Buffer.from(base64, "base64")) });
+
+  const frame = (extension, payloadBytes, tag = 0) => {
+    const fields = [[0,3],[0,4],[100,8],[0,1],[0,2],[0,1],[1,6],[0,1],[0,4],[1,5],[0,1],[0,1],[0,1]];
+    fields.push([6, 3], [extension === null ? payloadBytes : 15, 4]);
+    if (extension !== null) fields.push([extension, 8]);
+    for (let i = 0; i < payloadBytes; i++) fields.push([i === 0 ? tag << 4 : 0, 8]);
+    fields.push([7, 3]);
+    const bits = fields.map(([value, width]) => value.toString(2).padStart(width, "0")).join("");
+    return Uint8Array.from(bits.match(/.{1,8}/g), (byte) => parseInt(byte.padEnd(8, "0"), 2));
+  };
+  const decode = (module, packet) => {
+    const decoder = new module.WasmAacLcDecoder(Uint8Array.of(0x12, 0x08));
+    try { return decoder.decodeInterleaved(packet); } finally { decoder.free(); }
+  };
+  assert.throws(() => decode(original, frame(0, 14)), /invalid fill element length/);
+  const fixed = decode(patched, frame(0, 14));
+  assert.equal(fixed.length, 1024);
+  assert.deepEqual(fixed, decode(original, frame(null, 14)));
+  for (const extended of [1, 28, 255]) {
+    const packet = frame(extended, extended + 14);
+    assert.deepEqual(decode(patched, packet), decode(original, packet));
+  }
+  assert.throws(() => decode(patched, frame(0, 4)), /end of|bits/i);
+  assert.throws(() => decode(patched, frame(0, 14, 13)), /SBR\/HE-AAC/);
 });
 
 test.after(() => {

@@ -1056,8 +1056,6 @@ export interface DirectTrackStreams {
 export interface DirectMediaResolveOptions
   extends Omit<DirectRequestOptions, "method" | "query" | "body"> {
   consumerProductAvailable?: boolean;
-  /** Pick the more compatible rendition before starting the software decoder. */
-  preferStandardAac?: boolean;
   /** Do not retry the same rendition after a decoder failure. */
   excludeAacRendition?: SCAacRendition;
 }
@@ -1091,13 +1089,13 @@ function isHighQualityAac(value: RawTranscoding): boolean {
   );
 }
 
-function transcodingRank(value: RawTranscoding, preferStandardAac: boolean): number {
+function transcodingRank(value: RawTranscoding): number {
   const format = isRecord(value.format) ? value.format : {};
   const protocol = String(format.protocol ?? "").toLowerCase();
   const isHls = protocol === "hls" || protocol === "hls-aes";
   const codec = transcodingCodec(value);
   if (protocol === "progressive" && codec === "mp3") return 600;
-  if (isHls && codec === "aac") return isHighQualityAac(value) !== preferStandardAac ? 520 : 500;
+  if (isHls && codec === "aac") return isHighQualityAac(value) ? 520 : 500;
   if (isHls && codec === "mp3") return 400;
   return -1;
 }
@@ -1255,7 +1253,6 @@ async function resolveStreamsFromTrack(
   expectedTrackId: string,
   options: Omit<DirectRequestOptions, "method" | "query" | "body">,
   consumerProductAvailable?: boolean,
-  preferStandardAac = false,
   excludeAacRendition?: SCAacRendition,
 ): Promise<DirectTrackStreams> {
   const policy =
@@ -1323,7 +1320,7 @@ async function resolveStreamsFromTrack(
   const candidates = transcodings
     .map((transcoding) => ({
       transcoding,
-      rank: transcodingRank(transcoding, preferStandardAac),
+      rank: transcodingRank(transcoding),
       field: streamField(transcoding),
       fullness:
         transcoding.snipped === false
@@ -1402,7 +1399,6 @@ export async function resolveDirectTrackStreams(
 ): Promise<{ track: unknown; streams: DirectTrackStreams }> {
   const {
     consumerProductAvailable,
-    preferStandardAac,
     excludeAacRendition,
     ...requestOptions
   } = options;
@@ -1423,7 +1419,6 @@ export async function resolveDirectTrackStreams(
     trackId,
     requestOptions,
     consumerProductAvailable,
-    preferStandardAac,
     excludeAacRendition,
   );
   return { track, streams };

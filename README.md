@@ -4,7 +4,7 @@
   <p><strong>SoundCloud inside Spotify, powered by Spicetify.</strong></p>
   <p>Browse, search, manage your library, and play SoundCloud tracks through a Spotify-integrated player.</p>
   
-  ![Version](https://img.shields.io/badge/version-3.0.87-ff5500?style=flat-square)
+  ![Version](https://img.shields.io/badge/version-3.0.88-ff5500?style=flat-square)
   ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
   ![Spicetify](https://img.shields.io/badge/Spicetify-custom_app-1db954?style=flat-square)
   

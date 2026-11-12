@@ -1,6 +1,6 @@
 {
   "name": "wavelink-spicetify",
-  "version": "3.0.87",
+  "version": "3.0.88",
   "private": true,
   "description": "A no-local-bridge SoundCloud experience for Spicetify with OAuth, library features and Spotify-bar playback.",
   "type": "commonjs",

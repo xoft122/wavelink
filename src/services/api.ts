@@ -524,7 +524,7 @@ export async function getRelatedTracks(
 
 export async function createMediaSession(
   track: SCTrack,
-  options: Pick<DirectMediaResolveOptions, "preferStandardAac" | "excludeAacRendition"> = {},
+  options: Pick<DirectMediaResolveOptions, "excludeAacRendition"> = {},
 ): Promise<SCMediaSource> {
   const started = performance.now();
   try {
